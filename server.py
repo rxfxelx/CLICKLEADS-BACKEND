@@ -7,12 +7,12 @@ from collector import collect_numbers
 UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")
 UAZAPI_ADMIN_TOKEN = os.getenv("UAZAPI_ADMIN_TOKEN")
 
-app = FastAPI(title="Lead Extractor API", version="1.1.2")
+app = FastAPI(title="Lead Extractor API", version="1.1.3")
 
-# libera qualquer subdomínio do Vercel (preview/prod)
+# CORS: libera produção e previews do Vercel
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"https://.*\.vercel\.app",
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
     allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
 )
