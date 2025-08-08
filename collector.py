@@ -89,15 +89,14 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                         for m in PHONE_RE.findall(body or ""):
                             tel = norm_br_e164(m)
                             if tel and tel not in seen:
-                                seen.add(tel)
-                                out.append(tel)
+                                seen.add(tel); out.append(tel)
                                 if len(out) >= limite:
                                     break
                     except Exception:
                         pass
                     break
 
-                # preferir ARIA role
+                # preferir ARIA role; fallback pra classes
                 cards = page.get_by_role("article")
                 if cards.count() == 0:
                     cards = page.locator("div.VkpGBb, div[role='article']")
@@ -107,8 +106,9 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                     if len(out) >= limite:
                         break
 
-                    # abre painel do card
                     try:
+                        # garante visibilidade do card antes do clique
+                        cards.nth(i).scroll_into_view_if_needed()
                         cards.nth(i).click()
                         page.wait_for_selector(
                             "a[href^='tel:'], span:has-text('Telefone'), div:has-text('Telefone')",
@@ -117,7 +117,6 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                     except PWTimeoutError:
                         continue
 
-                    # 1) tenta link tel:
                     tel = None
                     try:
                         tel_link = page.locator("a[href^='tel:']").first
@@ -127,7 +126,6 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                     except PWError:
                         tel = None
 
-                    # 2) fallback: extrai por texto do painel
                     if not tel:
                         try:
                             blob = page.inner_text("body")
@@ -139,8 +137,7 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                             pass
 
                     if tel and tel not in seen:
-                        seen.add(tel)
-                        out.append(tel)
+                        seen.add(tel); out.append(tel)
 
                     # fecha painel e volta
                     try:
@@ -151,7 +148,7 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
 
                 if len(out) >= limite:
                     break
-                start += 20  # pagina de 20 em 20
+                start += 20  # pagina de 20 em 20 (Local Finder)
                 time.sleep(1.0)
 
             ctx.close()
