@@ -25,7 +25,10 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
     q = urllib.parse.quote(f"{nicho} {local}")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]  # docker-friendly
+        )
         ctx = browser.new_context(locale="pt-BR")
         page = ctx.new_page()
 
@@ -33,13 +36,10 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
         while len(out) < limite:
             url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={start}"
             page.goto(url, wait_until="domcontentloaded")
-
-            # Espera algo útil renderizar (evita ler página “vazia”)
             try:
                 page.wait_for_selector("a[href^='tel:'], div.VkpGBb", timeout=8000)
             except Exception:
-                # nada útil nesta página → parar paginação
-                break
+                break  # nada útil nesta página
 
             # 1) links tel:
             for a in page.locator('a[href^="tel:"]').all():
@@ -47,8 +47,10 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                 tel = norm_br_e164(raw)
                 if tel and tel not in seen:
                     seen.add(tel); out.append(tel)
-                    if len(out) >= limite: break
-            if len(out) >= limite: break
+                    if len(out) >= limite:
+                        break
+            if len(out) >= limite:
+                break
 
             # 2) fallback: regex nos cartões
             candidates = ["div.VkpGBb", "div[role=article]", "div[aria-level]"]
@@ -57,7 +59,8 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                 for el in page.locator(sel).all():
                     try:
                         t = el.inner_text(timeout=2000)
-                        if t: txts.append(t)
+                        if t:
+                            txts.append(t)
                     except Exception:
                         pass
             blob = "\n".join(txts)
@@ -65,7 +68,8 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                 tel = norm_br_e164(m)
                 if tel and tel not in seen:
                     seen.add(tel); out.append(tel)
-                    if len(out) >= limite: break
+                    if len(out) >= limite:
+                        break
 
             start += 20
             time.sleep(2.0)
