@@ -7,8 +7,10 @@ PHONE_RE = re.compile(r"\(?\d{2}\)?\s?\d{4,5}[-.\s]?\d{4}")
 
 def norm_br_e164(raw: str):
     d = re.sub(r"\D", "", raw or "")
-    if not d: return None
-    if not d.startswith("55"): d = "55" + d.lstrip("0")
+    if not d:
+        return None
+    if not d.startswith("55"):
+        d = "55" + d.lstrip("0")
     try:
         n = phonenumbers.parse("+" + d, None)
         if phonenumbers.is_possible_number(n) and phonenumbers.is_valid_number(n):
@@ -17,12 +19,14 @@ def norm_br_e164(raw: str):
         pass
     return None
 
-def _consent(page):
-    for sel in ("#L2AGLb",
-                "button:has-text('Aceitar tudo')",
-                "button:has-text('Concordo')",
-                "button:has-text('I agree')",
-                "div[role=button]:has-text('Aceitar tudo')"):
+def _accept_consent(page):
+    for sel in (
+        "#L2AGLb",
+        "button:has-text('Aceitar tudo')",
+        "button:has-text('Concordo')",
+        "button:has-text('I agree')",
+        "div[role=button]:has-text('Aceitar tudo')",
+    ):
         try:
             btn = page.locator(sel)
             if btn.count():
@@ -41,16 +45,25 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
         with sync_playwright() as p:
             browser = p.chromium.launch(
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"]
+                args=["--no-sandbox", "--disable-dev-shm-usage"],  # flags p/ Docker
             )
             ctx = browser.new_context(
                 locale="pt-BR",
-                user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+                user_agent=(
+                    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+                ),
             )
-            # bloqueia assets pesados pra reduzir erros/tempo
-            ctx.route("**/*", lambda r: r.abort() if any(r.request.url.endswith(ext)
-                    for ext in (".png",".jpg",".jpeg",".webp",".gif",".svg",".woff",".woff2",".ttf")) else r.continue_())
+            # corta imagens/fonts p/ acelerar/evitar crash
+            ctx.route(
+                "**/*",
+                lambda r: r.abort()
+                if any(
+                    r.request.url.endswith(ext)
+                    for ext in (".png", ".jpg", ".jpeg", ".webp", ".gif", ".svg", ".woff", ".woff2", ".ttf")
+                )
+                else r.continue_(),
+            )
             ctx.set_default_timeout(9000)
             ctx.set_default_navigation_timeout(18000)
 
@@ -64,70 +77,87 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                 except PWTimeoutError:
                     break
 
-                _consent(page)
+                _accept_consent(page)
 
-                # lista de resultados do Local Finder
+                # espera a lista do Local Finder
                 try:
-                    page.wait_for_selector("div[role='article'], div.VkpGBb", timeout=9000)
+                    page.wait_for_selector("div[role='article'], div.VkpGBb, div[role='feed']", timeout=9000)
                 except PWTimeoutError:
-                    # último fallback: regex no body
+                    # fallback: regex no body
                     try:
                         body = page.inner_text("body")
                         for m in PHONE_RE.findall(body or ""):
                             tel = norm_br_e164(m)
                             if tel and tel not in seen:
-                                seen.add(tel); out.append(tel)
-                                if len(out) >= limite: break
+                                seen.add(tel)
+                                out.append(tel)
+                                if len(out) >= limite:
+                                    break
                     except Exception:
                         pass
                     break
 
-                cards = page.locator("div[role='article'], div.VkpGBb")
-                qtd = cards.count()
+                # preferir ARIA role
+                cards = page.get_by_role("article")
+                if cards.count() == 0:
+                    cards = page.locator("div.VkpGBb, div[role='article']")
 
+                qtd = cards.count()
                 for i in range(qtd):
-                    if len(out) >= limite: break
-                    # abre o painel do card
+                    if len(out) >= limite:
+                        break
+
+                    # abre painel do card
                     try:
                         cards.nth(i).click()
-                        page.wait_for_selector("a[href^='tel:'], div:has-text('Telefone')", timeout=9000)
+                        page.wait_for_selector(
+                            "a[href^='tel:'], span:has-text('Telefone'), div:has-text('Telefone')",
+                            timeout=9000,
+                        )
                     except PWTimeoutError:
                         continue
 
                     # 1) tenta link tel:
+                    tel = None
                     try:
                         tel_link = page.locator("a[href^='tel:']").first
                         if tel_link.count():
                             raw = (tel_link.get_attribute("href") or "")[4:]
                             tel = norm_br_e164(raw)
-                            if tel and tel not in seen:
-                                seen.add(tel); out.append(tel)
-                        else:
-                            # 2) varre texto do painel
+                    except PWError:
+                        tel = None
+
+                    # 2) fallback: extrai por texto do painel
+                    if not tel:
+                        try:
                             blob = page.inner_text("body")
                             for m in PHONE_RE.findall(blob or ""):
                                 tel = norm_br_e164(m)
-                                if tel and tel not in seen:
-                                    seen.add(tel); out.append(tel); break
-                    except PWError:
-                        pass
+                                if tel:
+                                    break
+                        except Exception:
+                            pass
 
-                    # fecha painel (volta pra lista)
+                    if tel and tel not in seen:
+                        seen.add(tel)
+                        out.append(tel)
+
+                    # fecha painel e volta
                     try:
                         page.keyboard.press("Escape")
                         page.wait_for_timeout(150)
                     except Exception:
                         pass
 
-                    if len(out) >= limite: break
+                if len(out) >= limite:
+                    break
+                start += 20  # pagina de 20 em 20
+                time.sleep(1.0)
 
-                if len(out) >= limite: break
-                start += 20  # próxima página
-                time.sleep(1.2)
-
-            ctx.close(); browser.close()
+            ctx.close()
+            browser.close()
     except Exception:
-        # não propaga erro; retorna o que tiver
+        # não propaga; retorna o que tiver
         return out[:limite]
 
     return out[:limite]
