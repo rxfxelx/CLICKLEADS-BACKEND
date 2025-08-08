@@ -1,4 +1,4 @@
-import re, time, urllib.parse
+import re, time, urllib.parse, random
 from typing import List, Set
 import phonenumbers
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
@@ -30,8 +30,8 @@ def _accept_consent(page):
         try:
             btn = page.locator(sel)
             if btn.count():
-                btn.first.click(timeout=3000)
-                page.wait_for_timeout(300)
+                btn.first.click(timeout=2500)
+                page.wait_for_timeout(250)
                 break
         except Exception:
             pass
@@ -43,22 +43,22 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(
+            # contexto persistente: mantém cookies/consent e acelera execuções
+            ctx = p.chromium.launch_persistent_context(
+                user_data_dir="/tmp/pw-data",
                 headless=True,
-                args=["--no-sandbox", "--disable-dev-shm-usage"],  # docker-friendly
-            )
-            ctx = browser.new_context(
+                args=["--no-sandbox", "--disable-dev-shm-usage"],
                 locale="pt-BR",
                 user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                             "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
             )
-            # Bloqueia imagens/fonts pra acelerar
-            ctx.route(
-                "**/*",
-                lambda r: r.abort() if r.request.resource_type in {"image", "font", "media"} else r.continue_()
-            )
-            ctx.set_default_timeout(9000)
-            ctx.set_default_navigation_timeout(18000)
+            # bloqueia recursos pesados (mais rápido e estável)
+            ctx.route("**/*", lambda r: r.abort()
+                      if r.request.resource_type in {"image", "font", "stylesheet", "media"}
+                      else r.continue_())
+            # timeouts menores
+            ctx.set_default_timeout(6000)
+            ctx.set_default_navigation_timeout(12000)
 
             page = ctx.new_page()
             start = 0
@@ -66,7 +66,7 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
             while len(out) < limite:
                 url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={start}"
                 try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=18000)
+                    page.goto(url, wait_until="domcontentloaded", timeout=12000)
                 except PWTimeoutError:
                     break
 
@@ -74,7 +74,7 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
 
                 # Garante que a lista carregou
                 try:
-                    page.wait_for_selector("div[role='article'], div.VkpGBb, div[role='feed']", timeout=9000)
+                    page.wait_for_selector("div[role='article'], div.VkpGBb, div[role='feed']", timeout=7000)
                 except PWTimeoutError:
                     # Fallback: tenta achar número direto no body
                     try:
@@ -105,7 +105,7 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                         # Espera o painel abrir e exibir algo relacionado a telefone
                         page.wait_for_selector(
                             "a[href^='tel:'], span:has-text('Telefone'), div:has-text('Telefone')",
-                            timeout=9000,
+                            timeout=6000,
                         )
                     except PWTimeoutError:
                         continue
@@ -120,10 +120,11 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                     except PWError:
                         pass
 
-                    # 2) Fallback: varre o texto do painel
+                    # 2) Fallback: varre SOMENTE o painel (evita body pesado)
                     if not tel:
                         try:
-                            blob = page.inner_text("body")
+                            panel = page.locator("div[role='dialog'], div[role='region'], div[aria-modal='true']")
+                            blob = panel.inner_text() if panel.count() else ""
                             for m in PHONE_RE.findall(blob or ""):
                                 tel = norm_br_e164(m)
                                 if tel:
@@ -134,20 +135,19 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
                     if tel and tel not in seen:
                         seen.add(tel); out.append(tel)
 
-                    # Fecha o painel e volta pra lista
+                    # Fecha o painel e pausa curta randomizada (ritmo humano)
                     try:
                         page.keyboard.press("Escape")
-                        page.wait_for_timeout(150)
+                        page.wait_for_timeout(random.randint(180, 360))
                     except Exception:
                         pass
 
                 if len(out) >= limite:
                     break
                 start += 20  # paginação do Local Finder
-                time.sleep(1.0)
+                page.wait_for_timeout(random.randint(200, 420))
 
             ctx.close()
-            browser.close()
     except Exception:
         return out[:limite]
 
