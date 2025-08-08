@@ -1,25 +1,27 @@
-\
 import os
 from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 from collector import collect_numbers
 
-# UAZAPI envs
-UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")  # ex: https://helsenia.uazapi.com/chat/check
-UAZAPI_ADMIN_TOKEN = os.getenv("UAZAPI_ADMIN_TOKEN")              # admin token
+UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")
+UAZAPI_ADMIN_TOKEN = os.getenv("UAZAPI_ADMIN_TOKEN")
 
-app = FastAPI(title="Lead Extractor API", version="1.1.0")
+app = FastAPI(title="Lead Extractor API", version="1.1.1")
+
+# Libera só o domínio do seu front (Vercel)
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"], allow_methods=["*"], allow_headers=["*"]
+    allow_origins=["https://clickleads-frontend-5ila.vercel.app"],
+    allow_credentials=True,
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"],
 )
 
 async def check_whatsapp(e164: str):
     if not (UAZAPI_CHECK_URL and UAZAPI_ADMIN_TOKEN):
         return None
 
-    # tenta Authorization: Bearer e apikey, com 3 formatos de body
     headers_list = [
         {"Authorization": f"Bearer {UAZAPI_ADMIN_TOKEN}", "Content-Type": "application/json"},
         {"apikey": UAZAPI_ADMIN_TOKEN, "Content-Type": "application/json"},
