@@ -1,4 +1,3 @@
-\
 import re, time, urllib.parse
 from typing import List, Set
 import phonenumbers
@@ -35,7 +34,14 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
             url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={start}"
             page.goto(url, wait_until="domcontentloaded")
 
-            # 1) tentar links tel:
+            # Espera algo útil renderizar (evita ler página “vazia”)
+            try:
+                page.wait_for_selector("a[href^='tel:'], div.VkpGBb", timeout=8000)
+            except Exception:
+                # nada útil nesta página → parar paginação
+                break
+
+            # 1) links tel:
             for a in page.locator('a[href^="tel:"]').all():
                 raw = (a.get_attribute("href") or "").replace("tel:", "")
                 tel = norm_br_e164(raw)
@@ -64,5 +70,7 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
             start += 20
             time.sleep(2.0)
 
+        ctx.close()
         browser.close()
+
     return out[:limite]
