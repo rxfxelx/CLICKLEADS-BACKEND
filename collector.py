@@ -26,7 +26,7 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
     q = urllib.parse.quote(f"{nicho} {local}")
 
     with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True)
+        browser = p.chromium.launch(headless=True, args=["--no-sandbox"])
         ctx = browser.new_context(locale="pt-BR")
         page = ctx.new_page()
 
