@@ -1,9 +1,8 @@
-# collector.py — paralelo + “fast pass” (HTML) + clique limitado
-# usa persistent context e bloqueio de image/font/stylesheet/media
-# Docs: launch_persistent_context; bloquear resource_type; ProcessPoolExecutor; paginação tbm=lcl (start=20). :contentReference[oaicite:0]{index=0}
+# collector.py — paralelo + fast-pass (HTML) + poucos cliques
+# usa contexto persistente e bloqueio de image/font/stylesheet/media
 
 import re, urllib.parse, random, math
-from typing import List, Set
+from typing import List, Set, Tuple
 from concurrent.futures import ProcessPoolExecutor
 import phonenumbers
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
@@ -45,7 +44,6 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
     """Coleta números de UMA página (start=0/20/40...) com fast-pass + poucos cliques."""
     out: List[str] = []; seen: Set[str] = set()
     with sync_playwright() as p:
-        # persistente por página (dir único) → cookies/consent + estabilidade
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=f"/tmp/pw-data-{start}",
             headless=True,
@@ -83,14 +81,12 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
             if len(out) >= limite: break
             try:
                 el = cards.nth(i)
-                # tel: no card
                 tel_link = el.locator("a[href^='tel:']").first
                 if tel_link.count():
                     raw = (tel_link.get_attribute("href") or "")[4:]
                     tel = norm_br_e164(raw)
                     if tel and tel not in seen:
                         seen.add(tel); out.append(tel); continue
-                # texto do card
                 txt = el.inner_text(timeout=1200)
                 for m in PHONE_RE.findall(txt or ""):
                     tel = norm_br_e164(m)
@@ -158,6 +154,10 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
         ctx.close()
     return out
 
+def _page_job(args: Tuple[str, int, int, int]) -> List[str]:
+    q, st, limite, click = args
+    return _page_fast_and_fallback(q, st, limite, click)
+
 def collect_numbers(nicho: str, local: str, limite: int = 200) -> List[str]:
     q = urllib.parse.quote(f"{nicho} {local}")
     nums: List[str] = []; seen: Set[str] = set()
@@ -165,13 +165,15 @@ def collect_numbers(nicho: str, local: str, limite: int = 200) -> List[str]:
     # estimativa: ~6 por página via HTML → calcula páginas necessárias
     need_pages = max(1, math.ceil(limite / 6))
     need_pages = min(need_pages, MAX_PAGES_CAP)
-    offsets = [i*20 for i in range(need_pages)]  # tbm=lcl pagina 0,20,40,... :contentReference[oaicite:1]{index=1}
+    offsets = [i*20 for i in range(need_pages)]  # tbm=lcl pagina 0,20,40,...
 
-    # processa em lotes paralelos
+    # processa em lotes paralelos (evita lambda por causa do pickle)
     for i in range(0, len(offsets), MAX_WORKERS):
         batch = offsets[i:i+MAX_WORKERS]
+        rem = max(1, limite - len(nums))
+        args = [(q, st, rem, MAX_CLICKS_PER_PAGE) for st in batch]
         with ProcessPoolExecutor(max_workers=MAX_WORKERS) as ex:
-            results = ex.map(lambda st: _page_fast_and_fallback(q, st, limite, MAX_CLICKS_PER_PAGE), batch)
+            results = ex.map(_page_job, args)
             for arr in results:
                 for tel in arr:
                     if tel not in seen:
