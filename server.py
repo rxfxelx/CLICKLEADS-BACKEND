@@ -1,18 +1,17 @@
-# server.py — usa TOKEN DA INSTÂNCIA (não o admin) no /chat/check
-import os, json, asyncio
+# server.py — SSE com keep-alive e UAZAPI via TOKEN DE INSTÂNCIA
+import os, json, asyncio, time
 import httpx
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
-from collector import collect_numbers_info, iter_numbers
+from collector import collect_numbers_info, iter_numbers  # agora com multi-cidades
 
-# Vars de ambiente
 UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")  # ex: https://helsenia.uazapi.com/chat/check
-UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN")        # << token da INSTÂNCIA
+UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN")        # token DA INSTÂNCIA (não admin)
 
-app = FastAPI(title="Smart Leads API", version="1.8.0")
+app = FastAPI(title="Smart Leads API", version="1.9.0")
 
-# CORS (ajuste para o domínio do seu front se quiser restringir)
+# CORS (restrinja ao seu domínio se quiser)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -24,11 +23,10 @@ app.add_middleware(
 def health():
     return {"ok": True}
 
-# ---------- WhatsApp check (usa token da INSTÂNCIA) ----------
+# ------------ WhatsApp check (instância) ------------
 async def check_whatsapp(e164: str) -> bool | None:
     if not (UAZAPI_CHECK_URL and UAZAPI_INSTANCE_TOKEN):
         return None
-    # Testa formatos aceitos pela UAZAPI (token/apikey/Bearer)
     headers_try = [
         {"token": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
         {"apikey": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
@@ -44,7 +42,6 @@ async def check_whatsapp(e164: str) -> bool | None:
                     if 200 <= r.status_code < 300:
                         d = r.json() if r.content else {}
                         if isinstance(d, dict):
-                            # formatos comuns de retorno: exists/valid/is_whatsapp ou array data/numbers
                             if any(k in d for k in ("exists","valid","is_whatsapp")):
                                 return bool(d.get("exists") or d.get("valid") or d.get("is_whatsapp"))
                             arr = d.get("data") or d.get("numbers") or []
@@ -55,7 +52,7 @@ async def check_whatsapp(e164: str) -> bool | None:
                     continue
     return None
 
-# ---------- REST (com fallback) ----------
+# ------------ REST (fallback) ------------
 @app.get("/leads")
 async def leads(
     nicho: str,
@@ -64,13 +61,13 @@ async def leads(
     verify: int = Query(1, description="1=retorna só WhatsApp; 0=retorna todos"),
 ):
     try:
-        nums, exhausted = collect_numbers_info(nicho, local, n)
+        nums, exhausted = collect_numbers_info(nicho, local, n)  # multi-cidades + esgotado
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"collector_error: {type(e).__name__}")
 
     searched = len(nums)
     if verify:
-        sem = asyncio.Semaphore(12)
+        sem = asyncio.Semaphore(12)  # limite de concorrência na UAZAPI
         async def job(tel):
             async with sem:
                 ok = await check_whatsapp(tel)
@@ -88,7 +85,6 @@ async def leads(
             "exhausted": exhausted or (searched < n),
         }
 
-    # verify=0 → retorna todos (sem filtrar por WhatsApp)
     return {
         "count": searched,
         "items": [{"phone": t} for t in nums],
@@ -98,19 +94,23 @@ async def leads(
         "exhausted": exhausted or (searched < n),
     }
 
-# ---------- SSE (progresso em tempo real) ----------
+# ------------ SSE (tempo real) ------------
 @app.get("/leads/stream")
 def leads_stream(
     nicho: str,
-    local: str,
+    local: str,                           # pode ser "BH, Contagem, Betim"
     n: int = Query(50, ge=1, le=500),
     verify: int = Query(1, description="1=emitir apenas números com WhatsApp"),
 ):
     async def agen():
+        # evento inicial
         yield f"event: start\ndata: {json.dumps({'target': n})}\n\n"
+
         searched = 0
         wa_count = 0
         non_wa_count = 0
+
+        last_ping = time.time()
 
         async def wa_ok(tel: str) -> bool:
             if not verify:
@@ -119,19 +119,39 @@ def leads_stream(
             return bool(res)
 
         try:
-            for tel in iter_numbers(nicho, local, n):
+            for tel in iter_numbers(nicho, local, n):  # multi-cidades por baixo
                 searched += 1
                 if await wa_ok(tel):
                     wa_count += 1
+                    # item (apenas WA quando verify=1)
                     yield "event: item\n"
                     yield f"data: {json.dumps({'phone': tel, 'count': wa_count, 'searched': searched, 'wa_count': wa_count, 'non_wa_count': non_wa_count})}\n\n"
                 else:
                     non_wa_count += 1
+
+                # progresso (sempre)
                 yield "event: progress\n"
                 yield f"data: {json.dumps({'searched': searched, 'wa_count': wa_count, 'non_wa_count': non_wa_count})}\n\n"
+
+                # keep-alive a cada ~15s para proxies não derrubarem a conexão
+                if time.time() - last_ping > 15:
+                    yield ": keepalive\n\n"
+                    last_ping = time.time()
         finally:
             exhausted = (wa_count < n)
-            payload = {"count": wa_count, "searched": searched, "wa_count": wa_count, "non_wa_count": non_wa_count, "exhausted": exhausted}
+            payload = {
+                "count": wa_count,
+                "searched": searched,
+                "wa_count": wa_count,
+                "non_wa_count": non_wa_count,
+                "exhausted": exhausted
+            }
             yield f"event: done\ndata: {json.dumps(payload)}\n\n"
 
-    return StreamingResponse(agen(), media_type="text/event-stream")
+    headers = {
+        "Cache-Control": "no-cache",
+        "Connection": "keep-alive",
+        "X-Accel-Buffering": "no",  # evita buffering em proxies tipo Nginx/Cloudflare
+    }
+    # SSE precisa de text/event-stream e blocos \n\n. :contentReference[oaicite:1]{index=1}
+    return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8", headers=headers)
