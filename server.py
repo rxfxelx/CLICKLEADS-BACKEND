@@ -186,27 +186,43 @@ async def solve_contacts_sse(nicho: str, local: str, n: int, want_only_wa: bool)
 # ---------- REST ----------
 @app.get("/leads")
 async def leads(
-    nicho: str,
-    local: str,
+    nicho: str = Query(...),
+    local: str = Query(...),
     n: int = Query(50, ge=1, le=500),
-    verify: int = Query(1, description="1=retorna só WhatsApp; 0=retorna todos"),
+    verify: int = Query(0, ge=0, le=1),
 ):
     try:
-        wa, searched, non_wa, exhausted = await solve_contacts_once(
-            nicho, local, n, want_only_wa=bool(verify)
-        )
+        # coleta rápida
+        nums, exhausted = collect_numbers_info(nicho, local, n)
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"collector_error: {type(e).__name__}")
+        # agora devolve a mensagem da exceção pra debugar
+        raise HTTPException(status_code=500, detail=f"collector_error: {type(e).__name__}: {e}")
 
-    items = [{"phone": t} for t in (wa if verify else list(wa))]
+    items = [{"phone": p} for p in nums]
+
+    # verificação WA (se pedida)
+    wa_count = 0
+    non_wa_count = 0
+    if verify == 1 and nums:
+        is_wa = await bulk_check_whatsapp(nums)  # sua função atual de bulk (uazapi)
+        wa_only = []
+        for p, ok in zip(nums, is_wa):
+            if ok is True:
+                wa_only.append({"phone": p, "has_whatsapp": True})
+                wa_count += 1
+            elif ok is False:
+                non_wa_count += 1
+        items = wa_only  # mantém só WhatsApp
+
     return {
         "count": len(items),
         "items": items,
-        "searched": searched,
-        "wa_count": len(wa),
-        "non_wa_count": non_wa,
+        "searched": len(nums),
+        "wa_count": wa_count,
+        "non_wa_count": non_wa_count,
         "exhausted": exhausted,
     }
+
 
 # ---------- SSE ----------
 @app.get("/leads/stream")
@@ -226,3 +242,6 @@ def leads_stream(
         "X-Accel-Buffering": "no",
     }
     return StreamingResponse(agen(), media_type="text/event-stream; charset=utf-8", headers=headers)
+
+
+
