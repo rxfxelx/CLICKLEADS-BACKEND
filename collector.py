@@ -1,4 +1,4 @@
-# Rápido para 200–500: fast-pass (HTML) + poucos cliques + threads
+# collector.py — rápido: fast-pass (HTML) + poucos cliques + threads, multi-cidades
 import re, urllib.parse, random, math
 from typing import List, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,9 +7,9 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError,
 
 PHONE_RE = re.compile(r"\(?\d{2}\)?\s?\d{4,5}[-.\s]?\d{4}")
 
-# TUNÁVEIS
+# TUNÁVEIS (ajuste conforme recursos)
 MAX_WORKERS = 4
-MAX_PAGES_CAP = 30       # no máx 30 páginas (0..580)
+MAX_PAGES_CAP = 30          # páginas por cidade (0..580)
 MAX_CLICKS_PER_PAGE = 4
 NAV_TIMEOUT = 11000
 SEL_TIMEOUT = 6500
@@ -38,11 +38,12 @@ def _accept_consent(page):
         except Exception:
             pass
 
-def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -> List[str]:
+def _page_fast_and_fallback(query_str: str, start: int, limite: int, click_limit: int) -> List[str]:
+    """Coleta de UMA página (start=0/20/40...) — fast-pass + poucos cliques."""
     out: List[str] = []; seen: Set[str] = set()
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
-            user_data_dir=f"/tmp/pw-data-thread-{start}",
+            user_data_dir=f"/tmp/pw-data-{abs(hash((query_str, start)))%999999}",
             headless=True,
             args=["--no-sandbox","--disable-dev-shm-usage"],
             locale="pt-BR",
@@ -56,7 +57,7 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
         ctx.set_default_navigation_timeout(NAV_TIMEOUT)
 
         page = ctx.new_page()
-        url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={start}"
+        url = f"https://www.google.com/search?tbm=lcl&q={query_str}&hl=pt-BR&gl=BR&start={start}"
         try:
             page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
         except PWTimeoutError:
@@ -152,21 +153,24 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
     return out
 
 def _page_job(args: Tuple[str, int, int, int]) -> List[str]:
-    q, st, limite, click = args
-    return _page_fast_and_fallback(q, st, limite, click)
+    query_str, st, limite, click = args
+    return _page_fast_and_fallback(query_str, st, limite, click)
 
-def iter_numbers(nicho: str, local: str, limite: int = 50):
-    """Streama números conforme prontos (para /leads/stream)."""
-    q = urllib.parse.quote(f"{nicho} {local}")
+def _iter_single_city(nicho: str, cidade: str, limite: int):
+    """Itera números para UMA cidade."""
+    q = urllib.parse.quote(f"{nicho} {cidade}")
     seen: Set[str] = set()
-    nums_emitidos = 0
+    emitidos = 0
 
-    offsets = [i*20 for i in range(MAX_PAGES_CAP)]  # 0,20,40... até o limite de páginas
+    # estimativa ~6/pg
+    need_pages = max(1, math.ceil(limite / 6))
+    need_pages = min(need_pages, MAX_PAGES_CAP)
+    offsets = [i*20 for i in range(need_pages)]
+
     for i in range(0, len(offsets), MAX_WORKERS):
         batch = offsets[i:i+MAX_WORKERS]
-        rem = max(1, limite - nums_emitidos)
+        rem = max(1, limite - emitidos)
         args = [(q, st, rem, MAX_CLICKS_PER_PAGE) for st in batch]
-
         with ThreadPoolExecutor(max_workers=len(batch)) as ex:
             futs = [ex.submit(_page_job, a) for a in args]
             for fut in as_completed(futs):
@@ -179,9 +183,23 @@ def iter_numbers(nicho: str, local: str, limite: int = 50):
                     if tel not in seen:
                         seen.add(tel)
                         yield tel
-                        nums_emitidos += 1
-                        if nums_emitidos >= limite:
+                        emitidos += 1
+                        if emitidos >= limite:
                             return
+
+def iter_numbers(nicho: str, local: str, limite: int = 50):
+    """Itera números em multi-cidades (separadas por vírgula)."""
+    cidades = [c.strip() for c in local.split(",") if c.strip()]
+    if not cidades:
+        cidades = [local.strip()]
+    total = 0
+    for cidade in cidades:
+        rem = max(1, limite - total)
+        for tel in _iter_single_city(nicho, cidade, rem):
+            yield tel
+            total += 1
+            if total >= limite:
+                return
 
 def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
     out: List[str] = []
@@ -192,11 +210,10 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
     return out
 
 def collect_numbers_info(nicho: str, local: str, limite: int = 50) -> tuple[list[str], bool]:
-    """Retorna (numeros, exhausted). Exhausted=True se varremos as páginas e não atingimos a meta."""
+    """Retorna (nums, exhausted). Exhausted=True se varremos todas as cidades e não batemos o limite."""
     nums: List[str] = []
     for tel in iter_numbers(nicho, local, limite):
         nums.append(tel)
         if len(nums) >= limite:
             return nums, False
-    # se terminou sem alcançar o limite, consideramos esgotado
     return nums, True
