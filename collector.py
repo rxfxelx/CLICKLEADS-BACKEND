@@ -1,4 +1,4 @@
-# collector.py — rápido e estável: fast-pass (HTML) + clique limitado + threads
+# Rápido e estável p/ 200–500: fast-pass (HTML) + poucos cliques + threads
 import re, urllib.parse, random, math
 from typing import List, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,7 +7,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError,
 
 PHONE_RE = re.compile(r"\(?\d{2}\)?\s?\d{4,5}[-.\s]?\d{4}")
 
-# TUNÁVEIS (ajuste conforme recursos do Railway)
+# TUNÁVEIS (ajuste conforme recursos do host)
 MAX_WORKERS = 4            # threads em paralelo (cada uma abre seu Playwright)
 MAX_PAGES_CAP = 30         # no máx 30 páginas (0..580)
 MAX_CLICKS_PER_PAGE = 4    # clique só no necessário
@@ -43,9 +43,8 @@ def _accept_consent(page):
 def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -> List[str]:
     """Coleta de UMA página (start=0/20/40...) — fast-pass + poucos cliques."""
     out: List[str] = []; seen: Set[str] = set()
-
     with sync_playwright() as p:
-        # cada thread tem seu próprio diretório de usuário
+        # diretório por thread/start → cookies/consent persistem
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=f"/tmp/pw-data-thread-{start}",
             headless=True,
@@ -162,20 +161,20 @@ def _page_job(args: Tuple[str, int, int, int]) -> List[str]:
     q, st, limite, click = args
     return _page_fast_and_fallback(q, st, limite, click)
 
-def collect_numbers(nicho: str, local: str, limite: int = 200) -> List[str]:
-    """Coleta rápida para grandes volumes (200–500)."""
+def iter_numbers(nicho: str, local: str, limite: int = 50):
+    """Streama números conforme prontos (ótimo p/ /leads/stream)."""
     q = urllib.parse.quote(f"{nicho} {local}")
-    nums: List[str] = []; seen: Set[str] = set()
+    seen: Set[str] = set()
+    nums_emitidos = 0
 
-    # estimativa conservadora: ~6 por página via HTML
+    # estimativa: ~6/pg via HTML
     need_pages = max(1, math.ceil(limite / 6))
     need_pages = min(need_pages, MAX_PAGES_CAP)
-    offsets = [i*20 for i in range(need_pages)]  # tbm=lcl: 0,20,40,...
+    offsets = [i*20 for i in range(need_pages)]  # 0,20,40,...
 
-    # roda em lotes de até MAX_WORKERS threads
     for i in range(0, len(offsets), MAX_WORKERS):
         batch = offsets[i:i+MAX_WORKERS]
-        rem = max(1, limite - len(nums))
+        rem = max(1, limite - nums_emitidos)
         args = [(q, st, rem, MAX_CLICKS_PER_PAGE) for st in batch]
 
         with ThreadPoolExecutor(max_workers=len(batch)) as ex:
@@ -187,7 +186,16 @@ def collect_numbers(nicho: str, local: str, limite: int = 200) -> List[str]:
                     arr = []
                 for tel in arr:
                     if tel not in seen:
-                        seen.add(tel); nums.append(tel)
-                        if len(nums) >= limite:
-                            return nums
-    return nums
+                        seen.add(tel)
+                        yield tel
+                        nums_emitidos += 1
+                        if nums_emitidos >= limite:
+                            return
+
+def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
+    out: List[str] = []
+    for tel in iter_numbers(nicho, local, limite):
+        out.append(tel)
+        if len(out) >= limite:
+            break
+    return out
