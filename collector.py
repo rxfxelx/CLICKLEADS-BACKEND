@@ -1,4 +1,4 @@
-# Rápido e estável p/ 200–500: fast-pass (HTML) + poucos cliques + threads
+# Rápido para 200–500: fast-pass (HTML) + poucos cliques + threads
 import re, urllib.parse, random, math
 from typing import List, Set, Tuple
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -7,19 +7,17 @@ from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError,
 
 PHONE_RE = re.compile(r"\(?\d{2}\)?\s?\d{4,5}[-.\s]?\d{4}")
 
-# TUNÁVEIS (ajuste conforme recursos do host)
-MAX_WORKERS = 4            # threads em paralelo (cada uma abre seu Playwright)
-MAX_PAGES_CAP = 30         # no máx 30 páginas (0..580)
-MAX_CLICKS_PER_PAGE = 4    # clique só no necessário
-NAV_TIMEOUT = 11000        # navegação curta
-SEL_TIMEOUT = 6500         # seletor curto
+# TUNÁVEIS
+MAX_WORKERS = 4
+MAX_PAGES_CAP = 30       # no máx 30 páginas (0..580)
+MAX_CLICKS_PER_PAGE = 4
+NAV_TIMEOUT = 11000
+SEL_TIMEOUT = 6500
 
 def norm_br_e164(raw: str):
     d = re.sub(r"\D", "", raw or "")
-    if not d:
-        return None
-    if not d.startswith("55"):
-        d = "55" + d.lstrip("0")
+    if not d: return None
+    if not d.startswith("55"): d = "55" + d.lstrip("0")
     try:
         n = phonenumbers.parse("+" + d, None)
         if phonenumbers.is_possible_number(n) and phonenumbers.is_valid_number(n):
@@ -41,10 +39,8 @@ def _accept_consent(page):
             pass
 
 def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -> List[str]:
-    """Coleta de UMA página (start=0/20/40...) — fast-pass + poucos cliques."""
     out: List[str] = []; seen: Set[str] = set()
     with sync_playwright() as p:
-        # diretório por thread/start → cookies/consent persistem
         ctx = p.chromium.launch_persistent_context(
             user_data_dir=f"/tmp/pw-data-thread-{start}",
             headless=True,
@@ -53,7 +49,6 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
             user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
                         "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
         )
-        # bloqueia recursos pesados
         ctx.route("**/*", lambda r: r.abort()
                   if r.request.resource_type in {"image","font","stylesheet","media"}
                   else r.continue_())
@@ -78,7 +73,7 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
         if cards.count() == 0:
             cards = page.locator("div.VkpGBb, div[role='article']")
 
-        # ---------- FAST (sem clique): card (tel: + texto) ----------
+        # FAST (sem clique): tel: + texto do card
         for i in range(cards.count()):
             if len(out) >= limite: break
             try:
@@ -97,7 +92,7 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
             except Exception:
                 pass
 
-        # ---------- Feed inteiro (rápido) ----------
+        # Feed (rápido)
         if len(out) < limite and feed.count():
             try:
                 txt = feed.inner_text(timeout=1200)
@@ -109,7 +104,7 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
             except Exception:
                 pass
 
-        # ---------- Fallback com poucos cliques ----------
+        # Fallback: poucos cliques
         if len(out) < limite:
             to_click = min(click_limit, cards.count(), max(0, limite - len(out)))
             for i in range(to_click):
@@ -140,8 +135,7 @@ def _page_fast_and_fallback(q: str, start: int, limite: int, click_limit: int) -
                         blob = panel.inner_text() if panel.count() else ""
                         for m in PHONE_RE.findall(blob or ""):
                             tel = norm_br_e164(m)
-                            if tel:
-                                break
+                            if tel: break
                     except Exception:
                         pass
 
@@ -162,16 +156,12 @@ def _page_job(args: Tuple[str, int, int, int]) -> List[str]:
     return _page_fast_and_fallback(q, st, limite, click)
 
 def iter_numbers(nicho: str, local: str, limite: int = 50):
-    """Streama números conforme prontos (ótimo p/ /leads/stream)."""
+    """Streama números conforme prontos (para /leads/stream)."""
     q = urllib.parse.quote(f"{nicho} {local}")
     seen: Set[str] = set()
     nums_emitidos = 0
 
-    # estimativa: ~6/pg via HTML
-    need_pages = max(1, math.ceil(limite / 6))
-    need_pages = min(need_pages, MAX_PAGES_CAP)
-    offsets = [i*20 for i in range(need_pages)]  # 0,20,40,...
-
+    offsets = [i*20 for i in range(MAX_PAGES_CAP)]  # 0,20,40... até o limite de páginas
     for i in range(0, len(offsets), MAX_WORKERS):
         batch = offsets[i:i+MAX_WORKERS]
         rem = max(1, limite - nums_emitidos)
@@ -180,10 +170,11 @@ def iter_numbers(nicho: str, local: str, limite: int = 50):
         with ThreadPoolExecutor(max_workers=len(batch)) as ex:
             futs = [ex.submit(_page_job, a) for a in args]
             for fut in as_completed(futs):
+                arr = []
                 try:
                     arr = fut.result() or []
                 except Exception:
-                    arr = []
+                    pass
                 for tel in arr:
                     if tel not in seen:
                         seen.add(tel)
@@ -199,3 +190,13 @@ def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
         if len(out) >= limite:
             break
     return out
+
+def collect_numbers_info(nicho: str, local: str, limite: int = 50) -> tuple[list[str], bool]:
+    """Retorna (numeros, exhausted). Exhausted=True se varremos as páginas e não atingimos a meta."""
+    nums: List[str] = []
+    for tel in iter_numbers(nicho, local, limite):
+        nums.append(tel)
+        if len(nums) >= limite:
+            return nums, False
+    # se terminou sem alcançar o limite, consideramos esgotado
+    return nums, True
