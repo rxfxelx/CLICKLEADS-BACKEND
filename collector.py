@@ -1,60 +1,16 @@
-# collector.py — v2.2.1 (hotfix)
-# - MAX_WORKERS=1 (evita concorrência: Playwright sync não é thread-safe)
-# - Reinício automático do browser se perder a conexão
-# - NÃO bloqueia stylesheet (só image/font/media)
-# - Fallbacks: page.content() → feed → body → poucos cliques
-
-import re, urllib.parse, random, threading
-from typing import List, Set, Dict, Tuple
-from concurrent.futures import ThreadPoolExecutor, as_completed
-
+# collector.py — robusto p/ Google Local (tbm=lcl) + várias cidades
+import re, time, urllib.parse
+from typing import List, Set, Tuple, Dict
 import phonenumbers
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
 
-PHONE_RE = re.compile(r"\(?\d{2}\)?\s?\d{4,5}[-.\s]?\d{4}")
-
-# ---- Parâmetros de execução ----
-MAX_WORKERS = 1               # Playwright sync não é thread-safe -> uma thread
-MAX_PAGES_CAP = 30            # páginas por cidade (0,20,40,...)
-MAX_CLICKS_PER_PAGE = 4
-NAV_TIMEOUT = 11000
-SEL_TIMEOUT = 6500
-
-# ---- Playwright singleton com auto-restart ----
-_PW = None
-_BROWSER = None
-_INIT_LOCK = threading.Lock()
-
-def _start_browser():
-    global _PW, _BROWSER
-    if _PW is None:
-        _PW = sync_playwright().start()
-    _BROWSER = _PW.chromium.launch(
-        headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage",
-              "--disable-blink-features=AutomationControlled"],
-    )
-
-def _ensure_browser():
-    global _BROWSER
-    with _INIT_LOCK:
-        if _BROWSER is None:
-            _start_browser()
-        else:
-            try:
-                # Playwright expõe is_connected() no Browser
-                if not _BROWSER.is_connected():
-                    _start_browser()
-            except Exception:
-                _start_browser()
-    return _BROWSER
+# telefone BR (bem permissiva) + normalização E.164
+PHONE_RE = re.compile(r"\+?\d[\d .()\-]{8,}\d")
 
 def norm_br_e164(raw: str):
     d = re.sub(r"\D", "", raw or "")
-    if not d:
-        return None
-    if not d.startswith("55"):
-        d = "55" + d.lstrip("0")
+    if not d: return None
+    if not d.startswith("55"): d = "55" + d.lstrip("0")
     try:
         n = phonenumbers.parse("+" + d, None)
         if phonenumbers.is_possible_number(n) and phonenumbers.is_valid_number(n):
@@ -64,283 +20,145 @@ def norm_br_e164(raw: str):
     return None
 
 def _accept_consent(page):
-    for sel in ("#L2AGLb",
-                "button:has-text('Aceitar tudo')",
-                "button:has-text('Concordo')",
-                "button:has-text('I agree')",
-                "div[role=button]:has-text('Aceitar tudo')"):
+    sels = [
+        "#L2AGLb", "#introAgreeButton",
+        "button:has-text('Aceitar tudo')",
+        "button:has-text('Concordo')",
+        "button[aria-label='Aceitar tudo']",
+        "button:has-text('Accept all')",
+        "button[aria-label='Accept all']",
+        "div[role=button]:has-text('Aceitar')",
+    ]
+    for sel in sels:
         try:
-            b = page.locator(sel)
-            if b.count():
-                b.first.click(timeout=2200)
-                page.wait_for_timeout(200)
+            btn = page.locator(sel)
+            if btn.count():
+                btn.first.click(timeout=2000)
+                page.wait_for_timeout(250)
                 break
         except Exception:
             pass
 
-def _new_context_retry(browser):
-    # cria um contexto e roteia recursos pesados; se falhar, reinicia browser 1x
-    try:
-        ctx = browser.new_context(
-            locale="pt-BR",
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
-        )
-    except PWError:
-        # reinicia browser e tenta de novo
-        with _INIT_LOCK:
-            try:
-                if browser and browser.is_connected():
-                    browser.close()
-            except Exception:
-                pass
-            _start_browser()
-        browser = _ensure_browser()
-        ctx = browser.new_context(
-            locale="pt-BR",
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
-        )
+def init_state(local: str) -> Dict:
+    cities = [c.strip() for c in (local or "").split(",") if c.strip()]
+    if not cities: cities = [local.strip() or ""]
+    return {"cities": cities, "ci": 0, "start": 0, "done": [False]*len(cities)}
 
-    ctx.route("**/*",
-        lambda route: route.abort()
-        if route.request.resource_type in {"image", "font", "media"}
-        else route.continue_()
-    )
-    ctx.set_default_timeout(SEL_TIMEOUT)
-    ctx.set_default_navigation_timeout(NAV_TIMEOUT)
-    return ctx
+def _build_url(nicho: str, city: str, start: int) -> str:
+    q = urllib.parse.quote(f"{nicho} {city}".strip())
+    return f"https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={q}&start={start}"
 
-def _page_fast_and_fallback(query_str: str, start: int, limite: int, click_limit: int) -> List[str]:
+def _pull_from_text(text: str, seen: Set[str], out: List[str], want: int):
+    for m in PHONE_RE.findall(text or ""):
+        tel = norm_br_e164(m)
+        if tel and tel not in seen:
+            seen.add(tel); out.append(tel)
+            if len(out) >= want: break
+
+def collect_batch(nicho: str, state: Dict, want: int) -> Tuple[List[str], Dict, bool]:
+    cities, ci, start, done = state["cities"], state["ci"], state["start"], state["done"]
     out: List[str] = []
     seen: Set[str] = set()
 
-    browser = _ensure_browser()
-    ctx = _new_context_retry(browser)
-    page = ctx.new_page()
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]  # contêiner: memória/SHM
+        )
+        ctx = browser.new_context(
+            locale="pt-BR",
+            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+            extra_http_headers={"Accept-Language": "pt-BR,pt;q=0.9"}
+        )
+        # bloquear recursos pesados p/ acelerar (Playwright route)  :contentReference[oaicite:1]{index=1}
+        def intercept(route, request):
+            if request.resource_type in {"image", "media", "font"}:
+                return route.abort()
+            return route.continue_()
+        ctx.route("**/*", intercept)
 
-    url = f"https://www.google.com/search?tbm=lcl&q={query_str}&hl=pt-BR&gl=BR&start={start}"
-    try:
-        page.goto(url, wait_until="domcontentloaded", timeout=NAV_TIMEOUT)
-        page.wait_for_selector("body", timeout=3000)
-        page.wait_for_timeout(600)
-    except PWTimeoutError:
-        ctx.close(); return out
+        page = ctx.new_page()
+        city_exhausted = False
 
-    _accept_consent(page)
-
-    # 0) regex no HTML completo
-    try:
-        html = page.content()
-        for m in PHONE_RE.findall(html or ""):
-            tel = norm_br_e164(m)
-            if tel and tel not in seen:
-                seen.add(tel); out.append(tel)
-                if len(out) >= limite: break
-    except Exception:
-        pass
-    if len(out) >= limite:
-        ctx.close(); return out
-
-    # garante algo do Local Finder
-    try:
-        page.wait_for_selector("div[role='article'], div.VkpGBb, div[role='feed']", timeout=SEL_TIMEOUT)
-    except PWTimeoutError:
-        try:
-            body_txt = page.inner_text("body")
-            for m in PHONE_RE.findall(body_txt or ""):
-                tel = norm_br_e164(m)
-                if tel and tel not in seen:
-                    seen.add(tel); out.append(tel)
-                    if len(out) >= limite: break
-        except Exception:
-            pass
-        ctx.close(); return out
-
-    feed = page.locator("div[role='feed']")
-    cards = page.get_by_role("article")
-    if cards.count() == 0:
-        cards = page.locator("div.VkpGBb, div[role='article']")
-
-    # 1) varre cards sem clicar
-    for i in range(cards.count()):
-        if len(out) >= limite: break
-        try:
-            el = cards.nth(i)
-            tel_link = el.locator("a[href^='tel:']").first
-            if tel_link.count():
-                raw = (tel_link.get_attribute("href") or "")[4:]
-                tel = norm_br_e164(raw)
-                if tel and tel not in seen:
-                    seen.add(tel); out.append(tel); continue
-            txt = el.inner_text(timeout=900)
-            for m in PHONE_RE.findall(txt or ""):
-                tel = norm_br_e164(m)
-                if tel and tel not in seen:
-                    seen.add(tel); out.append(tel); break
-        except Exception:
-            pass
-    if len(out) >= limite:
-        ctx.close(); return out
-
-    # 2) regex no feed
-    if feed.count():
-        try:
-            txt = feed.inner_text(timeout=1200)
-            for m in PHONE_RE.findall(txt or ""):
-                tel = norm_br_e164(m)
-                if tel and tel not in seen:
-                    seen.add(tel); out.append(tel)
-                    if len(out) >= limite: break
-        except Exception:
-            pass
-    if len(out) >= limite:
-        ctx.close(); return out
-
-    # 3) regex no body
-    try:
-        body_txt = page.inner_text("body")
-        for m in PHONE_RE.findall(body_txt or ""):
-            tel = norm_br_e164(m)
-            if tel and tel not in seen:
-                seen.add(tel); out.append(tel)
-                if len(out) >= limite: break
-    except Exception:
-        pass
-    if len(out) >= limite:
-        ctx.close(); return out
-
-    # 4) poucos cliques em cards
-    to_click = min(click_limit, cards.count(), max(0, limite - len(out)))
-    for i in range(to_click):
-        if len(out) >= limite: break
-        try:
-            it = cards.nth(i)
-            it.scroll_into_view_if_needed()
-            it.click(force=True)
-            page.wait_for_selector(
-                "a[href^='tel:'], span:has-text('Telefone'), div:has-text('Telefone')",
-                timeout=SEL_TIMEOUT,
-            )
-        except PWTimeoutError:
-            continue
-
-        tel = None
-        try:
-            link = page.locator("a[href^='tel:']").first
-            if link.count():
-                raw = (link.get_attribute("href") or "")[4:]
-                tel = norm_br_e164(raw)
-        except PWError:
-            tel = None
-
-        if not tel:
+        # avança até achar algo nesta cidade ou concluir que acabou
+        while not done[ci] and len(out) < want:
+            url = _build_url(nicho, cities[ci], start)
             try:
-                panel = page.locator("div[role='dialog'], div[role='region'], div[aria-modal='true']")
-                blob = panel.inner_text() if panel.count() else ""
-                for m in PHONE_RE.findall(blob or ""):
-                    tel = norm_br_e164(m)
-                    if tel: break
-            except Exception:
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            except PWTimeoutError:
+                break
+
+            _accept_consent(page)
+
+            # 1) tenta anchors tel:
+            try:
+                tel_links = page.locator('a[href^="tel:"]')
+                for i in range(tel_links.count()):
+                    href = tel_links.nth(i).get_attribute("href") or ""
+                    raw = href.replace("tel:", "")
+                    tel = norm_br_e164(raw)
+                    if tel and tel not in seen:
+                        seen.add(tel); out.append(tel)
+                        if len(out) >= want: break
+            except PWError:
                 pass
 
-        if tel and tel not in seen:
-            seen.add(tel); out.append(tel)
+            # 2) coleta texto dos cartões + fallback HTML inteiro
+            if len(out) < want:
+                try:
+                    # cartões típicos do Local Finder
+                    blobs = []
+                    for sel in ("div[role='article']", "div.VkpGBb", "div[aria-level]"):
+                        els = page.locator(sel)
+                        for k in range(min(50, els.count())):
+                            try:
+                                t = els.nth(k).inner_text(timeout=500)
+                                if t: blobs.append(t)
+                            except Exception:
+                                pass
+                    if not blobs:
+                        # fallback: HTML bruto
+                        html = page.content()
+                        _pull_from_text(html, seen, out, want)
+                    else:
+                        _pull_from_text("\n".join(blobs), seen, out, want)
+                except Exception:
+                    pass
 
-        try:
-            page.keyboard.press("Escape")
-            page.wait_for_timeout(random.randint(120, 240))
-        except Exception:
-            pass
+            # heurística de paginação/encerramento
+            found_this_page = len(out) > 0
+            if not found_this_page:
+                # nada nesta página -> tenta próxima página uma vez; senão, esgota cidade
+                if start == state["start"]:
+                    start += 20
+                else:
+                    city_exhausted = True
+            else:
+                # se ainda quer mais, próxima página
+                if len(out) < want:
+                    start += 20
 
-    ctx.close()
-    return out
+            # se decidiu esgotar cidade
+            if city_exhausted:
+                done[ci] = True
+                # próxima cidade
+                next_ci = None
+                for idx, flag in enumerate(done):
+                    if not flag:
+                        next_ci = idx; break
+                if next_ci is None:
+                    break
+                ci = next_ci
+                start = 0
+                city_exhausted = False
 
-# ---- Round-robin por cidades (sem concorrência) ----
-def init_state(local: str) -> Dict:
-    cities = [c.strip() for c in local.split(",") if c.strip()] or [local.strip()]
-    return {"cities": cities, "next_page": {c: 0 for c in cities}}
+            # pequeno respiro p/ evitar throttle
+            page.wait_for_timeout(350)
 
-def collect_batch(nicho: str, state: Dict, limit: int) -> Tuple[List[str], Dict, bool]:
-    _ensure_browser()  # aquece
-    cities = state["cities"]
-    next_page = state["next_page"].copy()
+        ctx.close(); browser.close()
 
-    jobs: List[Tuple[str, int]] = []
-    city_idx = 0
-    while len(jobs) < MAX_WORKERS:
-        c = cities[city_idx % len(cities)]
-        if next_page[c] >= MAX_PAGES_CAP:
-            city_idx += 1
-            if all(next_page[x] >= MAX_PAGES_CAP for x in cities):
-                break
-            continue
-        jobs.append((c, next_page[c]))
-        next_page[c] += 1
-        city_idx += 1
-
-    if not jobs:
-        return [], {"cities": cities, "next_page": next_page}, True
-
-    results: List[str] = []
-    # ainda usamos ThreadPool, mas com max_workers=1 (sem concorrência real)
-    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
-        futs = []
-        for (city, page_idx) in jobs:
-            q = urllib.parse.quote(f"{nicho} {city}")
-            start = page_idx * 20
-            futs.append(ex.submit(_page_fast_and_fallback, q, start, limit, MAX_CLICKS_PER_PAGE))
-        for fut in as_completed(futs):
-            try:
-                arr = fut.result() or []
-                results.extend(arr)
-            except Exception:
-                pass
-
-    if len(results) > limit:
-        results = results[:limit]
-
-    exhausted_all = all(next_page[c] >= MAX_PAGES_CAP for c in cities)
-    new_state = {"cities": cities, "next_page": next_page}
-    return results, new_state, exhausted_all
-
-def iter_numbers(nicho: str, local: str, limite: int = 50):
-    cities = [c.strip() for c in local.split(",") if c.strip()] or [local.strip()]
-    total = 0
-    for cidade in cities:
-        rem = max(1, limite - total)
-        state = {"cities": [cidade], "next_page": {cidade: 0}}
-        while total < limite:
-            batch, state, exhausted = collect_batch(nicho, state, rem)
-            for tel in batch:
-                yield tel
-                total += 1
-                if total >= limite:
-                    return
-            if exhausted:
-                break
-
-def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
-    out: List[str] = []
-    for tel in iter_numbers(nicho, local, limite):
-        out.append(tel)
-        if len(out) >= limite:
-            break
-    return out
-
-def collect_numbers_info(nicho: str, local: str, limite: int = 50) -> Tuple[List[str], bool]:
-    nums: List[str] = []
-    exhausted_all = False
-    cities = [c.strip() for c in local.split(",") if c.strip()] or [local.strip()]
-    for cidade in cities:
-        rem = max(1, limite - len(nums))
-        state = {"cities": [cidade], "next_page": {cidade: 0}}
-        while len(nums) < limite:
-            batch, state, exhausted = collect_batch(nicho, state, rem)
-            for t in batch:
-                if t not in nums:
-                    nums.append(t)
-            if len(nums) >= limite or exhausted:
-                exhausted_all = exhausted_all or exhausted
-                break
-    return nums[:limite], exhausted_all or (len(nums) < limite)
+    # atualiza state
+    state["ci"], state["start"], state["done"] = ci, start, done
+    exhausted_all = all(done)
+    return out, state, exhausted_all
