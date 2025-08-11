@@ -1,17 +1,18 @@
-# server.py — Smart Leads API (fix NameError + UAZAPI instance token)
+# server.py — Smart Leads API (fix Playwright sync + UAZAPI instance token)
 import os, json
 from typing import AsyncGenerator, List, Tuple
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import StreamingResponse
 import httpx
+from anyio import to_thread  # <- chave do conserto
 
-from collector import init_state, collect_batch  # <- só estes
+from collector import init_state, collect_batch  # coletor síncrono
 
 UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")
 UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "")
 
-app = FastAPI(title="Smart Leads API", version="2.2.1")
+app = FastAPI(title="Smart Leads API", version="2.2.2")
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https://.*\.vercel\.app$",
@@ -21,8 +22,7 @@ app.add_middleware(
 
 # ---------- UAZAPI bulk ----------
 async def bulk_check_whatsapp(numbers: List[str]) -> List[bool | None]:
-    if not numbers:
-        return []
+    if not numbers: return []
     if not (UAZAPI_CHECK_URL and UAZAPI_INSTANCE_TOKEN):
         return [None] * len(numbers)
 
@@ -31,10 +31,7 @@ async def bulk_check_whatsapp(numbers: List[str]) -> List[bool | None]:
         {"Authorization": f"Bearer {UAZAPI_INSTANCE_TOKEN}", "Content-Type": "application/json"},
         {"apikey": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
     ]
-    bodies = [
-        {"numbers": numbers},
-        {"data": [{"number": n} for n in numbers]},
-    ]
+    bodies = [{"numbers": numbers}, {"data": [{"number": n} for n in numbers]}]
 
     async with httpx.AsyncClient(timeout=30) as cx:
         for hdr in headers_list:
@@ -43,8 +40,8 @@ async def bulk_check_whatsapp(numbers: List[str]) -> List[bool | None]:
                     r = await cx.post(UAZAPI_CHECK_URL, json=body, headers=hdr)
                     if 200 <= r.status_code < 300:
                         data = r.json()
-                        out: List[bool | None] = []
                         src = data if isinstance(data, list) else (data.get("data") or data.get("numbers") or [])
+                        out: List[bool | None] = []
                         for item in src:
                             if isinstance(item, dict):
                                 ok = item.get("isInWhatsapp")
@@ -59,7 +56,7 @@ async def bulk_check_whatsapp(numbers: List[str]) -> List[bool | None]:
                     continue
     return [None] * len(numbers)
 
-# ---------- Coleta até atingir meta ----------
+# ---------- coleta até atingir meta (sem travar event loop) ----------
 async def collect_until_target(nicho: str, local: str, n: int, verify: int) -> Tuple[List[str], int, int, bool]:
     state = init_state(local)
     pool: List[str] = []
@@ -68,7 +65,8 @@ async def collect_until_target(nicho: str, local: str, n: int, verify: int) -> T
     non_wa_count = 0
 
     while True:
-        batch, state, exhausted = collect_batch(nicho, state, max(n, 10))
+        # roda o coletor SÍNCRONO em thread separada
+        batch, state, exhausted = await to_thread.run_sync(collect_batch, nicho, state, max(n, 10))
         exhausted_all = exhausted_all or exhausted
         for t in batch:
             if t not in seen:
@@ -90,7 +88,7 @@ async def collect_until_target(nicho: str, local: str, n: int, verify: int) -> T
         if exhausted_all:
             return (pool[:n] if verify == 0 else []), searched, non_wa_count, exhausted_all
 
-# ---------- Endpoints ----------
+# ---------- endpoints ----------
 @app.get("/health")
 def health():
     return {"ok": True}
