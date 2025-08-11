@@ -1,15 +1,15 @@
-# collector.py — rápido: fast-pass (HTML) + poucos cliques + threads, multi-cidades
-import re, urllib.parse, random, math
-from typing import List, Set, Tuple
+# Rápido: fast-pass (HTML) + poucos cliques + threads, com estado e multi-cidades
+import re, urllib.parse, random
+from typing import List, Set, Tuple, Dict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import phonenumbers
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
 
 PHONE_RE = re.compile(r"\(?\d{2}\)?\s?\d{4,5}[-.\s]?\d{4}")
 
-# TUNÁVEIS (ajuste conforme recursos)
-MAX_WORKERS = 4
-MAX_PAGES_CAP = 30          # páginas por cidade (0..580)
+# TUNÁVEIS
+MAX_WORKERS = 4              # threads por rodada
+MAX_PAGES_CAP = 30           # páginas por cidade (0..580)
 MAX_CLICKS_PER_PAGE = 4
 NAV_TIMEOUT = 11000
 SEL_TIMEOUT = 6500
@@ -39,7 +39,6 @@ def _accept_consent(page):
             pass
 
 def _page_fast_and_fallback(query_str: str, start: int, limite: int, click_limit: int) -> List[str]:
-    """Coleta de UMA página (start=0/20/40...) — fast-pass + poucos cliques."""
     out: List[str] = []; seen: Set[str] = set()
     with sync_playwright() as p:
         ctx = p.chromium.launch_persistent_context(
@@ -74,7 +73,7 @@ def _page_fast_and_fallback(query_str: str, start: int, limite: int, click_limit
         if cards.count() == 0:
             cards = page.locator("div.VkpGBb, div[role='article']")
 
-        # FAST (sem clique): tel: + texto do card
+        # FAST
         for i in range(cards.count()):
             if len(out) >= limite: break
             try:
@@ -93,7 +92,7 @@ def _page_fast_and_fallback(query_str: str, start: int, limite: int, click_limit
             except Exception:
                 pass
 
-        # Feed (rápido)
+        # Feed inteiro
         if len(out) < limite and feed.count():
             try:
                 txt = feed.inner_text(timeout=1200)
@@ -105,7 +104,7 @@ def _page_fast_and_fallback(query_str: str, start: int, limite: int, click_limit
             except Exception:
                 pass
 
-        # Fallback: poucos cliques
+        # Fallback com poucos cliques
         if len(out) < limite:
             to_click = min(click_limit, cards.count(), max(0, limite - len(out)))
             for i in range(to_click):
@@ -152,68 +151,62 @@ def _page_fast_and_fallback(query_str: str, start: int, limite: int, click_limit
         ctx.close()
     return out
 
-def _page_job(args: Tuple[str, int, int, int]) -> List[str]:
-    query_str, st, limite, click = args
-    return _page_fast_and_fallback(query_str, st, limite, click)
+# ----------------- Estado e batch por cidades -----------------
+def init_state(local: str) -> Dict:
+    cities = [c.strip() for c in local.split(",") if c.strip()] or [local.strip()]
+    return {"cities": cities, "next_page": {c: 0 for c in cities}}
 
-def _iter_single_city(nicho: str, cidade: str, limite: int):
-    """Itera números para UMA cidade."""
-    q = urllib.parse.quote(f"{nicho} {cidade}")
-    seen: Set[str] = set()
-    emitidos = 0
+def collect_batch(nicho: str, state: Dict, limit: int) -> tuple[list[str], Dict, bool]:
+    """
+    Busca um LOTE de páginas (round-robin entre cidades) e retorna (nums, new_state, exhausted_all)
+    """
+    cities = state["cities"]
+    next_page = state["next_page"].copy()
 
-    # estimativa ~6/pg
-    need_pages = max(1, math.ceil(limite / 6))
-    need_pages = min(need_pages, MAX_PAGES_CAP)
-    offsets = [i*20 for i in range(need_pages)]
+    # monta lista de páginas a processar nesta rodada (até MAX_WORKERS páginas no total)
+    jobs: list[tuple[str, int]] = []
+    city_idx = 0
+    while len(jobs) < MAX_WORKERS:
+        c = cities[city_idx % len(cities)]
+        if next_page[c] >= MAX_PAGES_CAP:
+            city_idx += 1
+            # todas esgotadas?
+            if all(next_page[x] >= MAX_PAGES_CAP for x in cities):
+                break
+            continue
+        jobs.append((c, next_page[c]))
+        next_page[c] += 1
+        city_idx += 1
 
-    for i in range(0, len(offsets), MAX_WORKERS):
-        batch = offsets[i:i+MAX_WORKERS]
-        rem = max(1, limite - emitidos)
-        args = [(q, st, rem, MAX_CLICKS_PER_PAGE) for st in batch]
-        with ThreadPoolExecutor(max_workers=len(batch)) as ex:
-            futs = [ex.submit(_page_job, a) for a in args]
-            for fut in as_completed(futs):
-                arr = []
-                try:
-                    arr = fut.result() or []
-                except Exception:
-                    pass
-                for tel in arr:
-                    if tel not in seen:
-                        seen.add(tel)
-                        yield tel
-                        emitidos += 1
-                        if emitidos >= limite:
-                            return
+        # se todas já marcaram uma página nesta rodada, pode continuar round-robin
 
-def iter_numbers(nicho: str, local: str, limite: int = 50):
-    """Itera números em multi-cidades (separadas por vírgula)."""
-    cidades = [c.strip() for c in local.split(",") if c.strip()]
-    if not cidades:
-        cidades = [local.strip()]
-    total = 0
-    for cidade in cidades:
-        rem = max(1, limite - total)
-        for tel in _iter_single_city(nicho, cidade, rem):
-            yield tel
-            total += 1
-            if total >= limite:
-                return
-
-def collect_numbers(nicho: str, local: str, limite: int = 50) -> List[str]:
-    out: List[str] = []
-    for tel in iter_numbers(nicho, local, limite):
-        out.append(tel)
-        if len(out) >= limite:
+        if all(next_page[x] > state["next_page"][x] for x in cities) and len(jobs) >= MAX_WORKERS:
             break
-    return out
 
-def collect_numbers_info(nicho: str, local: str, limite: int = 50) -> tuple[list[str], bool]:
-    """Retorna (nums, exhausted). Exhausted=True se varremos todas as cidades e não batemos o limite."""
-    nums: List[str] = []
-    for tel in iter_numbers(nicho, local, limite):
-        nums.append(tel)
-        if len(nums) >= limite:
-            return nums, False
-    return nums, True
+    if not jobs:
+        # esgotado
+        return [], {"cities": cities, "next_page": next_page}, True
+
+    # executa páginas em paralelo
+    results: list[str] = []
+    with ThreadPoolExecutor(max_workers=len(jobs)) as ex:
+        futs = []
+        for (city, page_idx) in jobs:
+            q = urllib.parse.quote(f"{nicho} {city}")
+            start = page_idx * 20
+            futs.append(ex.submit(_page_fast_and_fallback, q, start, limit, MAX_CLICKS_PER_PAGE))
+        for fut in as_completed(futs):
+            try:
+                arr = fut.result() or []
+                results.extend(arr)
+            except Exception:
+                pass
+
+    # limita o lote ao 'limit' pedido (apenas para reduzir explosão de dados por rodada)
+    if len(results) > limit:
+        results = results[:limit]
+
+    exhausted_all = all(next_page[c] >= MAX_PAGES_CAP for c in cities)
+
+    new_state = {"cities": cities, "next_page": next_page}
+    return results, new_state, exhausted_all
