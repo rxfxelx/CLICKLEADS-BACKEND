@@ -1,217 +1,216 @@
-# server.py — Smart Leads API (v2.3.1)
-# - Usa token da INSTÂNCIA da UAZAPI
-# - Verificação em lotes (chunk) e números só com dígitos (5511...)
-# - Coletor síncrono rodando em thread (to_thread.run_sync)
-# - SSE com progress/item/done e flag verify_failed
-
-import os, json, re
-from typing import AsyncGenerator, List, Tuple, Optional
-from fastapi import FastAPI, Query, HTTPException
+import os, json, math
+from typing import Dict, List, Iterable
+from fastapi import FastAPI, Query
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import StreamingResponse
+from fastapi.responses import JSONResponse, StreamingResponse
 import httpx
-from anyio import to_thread
 
-from collector import init_state, collect_batch  # coletor síncrono
+from collector import collect_numbers_ex
 
-# --------- ENV ---------
-UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")
-UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "")
+# ====== Config ======
+UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")  # ex: https://helsenia.uazapi.com/chat/check
+UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN")        # instance token (use este!)
+# Opcional: limite de batch por chamada na verificação
+VERIFY_BATCH = int(os.getenv("VERIFY_BATCH", "150"))
 
-# --------- APP / CORS ---------
-app = FastAPI(title="Smart Leads API", version="2.3.1")
+app = FastAPI(title="Smart Leads API", version="2.2.0")
+
+# CORS (Vercel + localhost)
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https://.*\.vercel\.app$",
+    allow_origin_regex=r"^https?://.*",
+    allow_credentials=False,
     allow_methods=["GET", "OPTIONS"],
     allow_headers=["*"],
 )
 
-# --------- UAZAPI bulk (chunks + só dígitos) ---------
-async def bulk_check_whatsapp(numbers: List[str]) -> Tuple[List[Optional[bool]], bool]:
+# ====== WhatsApp check ======
+def check_whatsapp_bulk(numbers: List[str]) -> Dict[str, bool]:
     """
-    Retorna (flags, failed):
-      flags  -> lista de True/False/None por número
-      failed -> True se tudo veio None (falha na verificação)
+    Faz UMA ou poucas chamadas em lote à UAZAPI.
+    Retorna {e164: True/False} para cada número.
+    Se não houver configuração, assume True para não bloquear o fluxo quando 'verify=1'.
     """
-    if not numbers:
-        return [], False
     if not (UAZAPI_CHECK_URL and UAZAPI_INSTANCE_TOKEN):
-        return [None] * len(numbers), True
+        return {n: True for n in numbers}  # sem verificação configurada → não filtra
 
-    # normaliza para SOMENTE DÍGITOS
-    nums = [re.sub(r"\D", "", n or "") for n in numbers]
+    out: Dict[str, bool] = {}
+    headers = {"apikey": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"}
+    with httpx.Client(timeout=30) as cx:
+        for i in range(0, len(numbers), VERIFY_BATCH):
+            chunk = numbers[i : i + VERIFY_BATCH]
+            try:
+                r = cx.post(UAZAPI_CHECK_URL, headers=headers, json={"numbers": chunk})
+                if r.status_code >= 200 and r.status_code < 300:
+                    data = r.json()
+                    # formatos possíveis
+                    arr = None
+                    if isinstance(data, dict):
+                        if "numbers" in data and isinstance(data["numbers"], list):
+                            arr = data["numbers"]
+                        elif "data" in data and isinstance(data["data"], list):
+                            arr = data["data"]
+                    if isinstance(arr, list):
+                        for item in arr:
+                            if isinstance(item, dict):
+                                num = item.get("number") or item.get("phone")
+                                if not num:
+                                    continue
+                                exists = bool(item.get("exists") or item.get("valid") or item.get("is_whatsapp"))
+                                out[num] = exists
+                    else:
+                        # fallback: se a API retornar um único dict
+                        if isinstance(data, dict):
+                            exists = bool(data.get("exists") or data.get("valid") or data.get("is_whatsapp"))
+                            if exists and len(chunk) == 1:
+                                out[chunk[0]] = True
+                            elif len(chunk) == 1:
+                                out[chunk[0]] = False
+                else:
+                    # em erro, não bloqueia
+                    for n in chunk:
+                        out[n] = True
+            except Exception:
+                for n in chunk:
+                    out[n] = True
+    # garante que todos tenham valor
+    for n in numbers:
+        out.setdefault(n, True)
+    return out
 
-    out_flags: List[Optional[bool]] = [None] * len(nums)
-    failed_all = True
-    CHUNK = 90
+# ====== Helpers ======
+def _json_items(phones: List[str], mask_whatsapp: Dict[str, bool] | None) -> List[Dict]:
+    items = []
+    if mask_whatsapp is None:
+        # verify=0 → has_whatsapp = None
+        for p in phones:
+            items.append({"phone": p, "has_whatsapp": None})
+    else:
+        for p in phones:
+            items.append({"phone": p, "has_whatsapp": bool(mask_whatsapp.get(p, False))})
+    return items
 
-    async with httpx.AsyncClient(timeout=30) as cx:
-        for i in range(0, len(nums), CHUNK):
-            chunk = nums[i:i + CHUNK]
-
-            headers_list = [
-                {"token": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
-                {"Authorization": f"Bearer {UAZAPI_INSTANCE_TOKEN}", "Content-Type": "application/json"},
-                {"apikey": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
-            ]
-            bodies = [
-                {"numbers": chunk},
-                {"data": [{"number": n} for n in chunk]},
-            ]
-
-            flags_chunk: List[Optional[bool]] = [None] * len(chunk)
-            got_something = False
-
-            for hdr in headers_list:
-                for body in bodies:
-                    try:
-                        r = await cx.post(UAZAPI_CHECK_URL, json=body, headers=hdr)
-                        if 200 <= r.status_code < 300:
-                            data = r.json()
-                            src = data if isinstance(data, list) else (data.get("data") or data.get("numbers") or [])
-                            for idx, item in enumerate(src[:len(chunk)]):
-                                ok = None
-                                if isinstance(item, dict):
-                                    ok = item.get("isInWhatsapp")
-                                    if ok is None: ok = item.get("is_whatsapp")
-                                    if ok is None: ok = item.get("valid") or item.get("exists")
-                                flags_chunk[idx] = (bool(ok) if ok is not None else None)
-                            got_something = any(v is not None for v in flags_chunk)
-                            if got_something:
-                                break
-                    except Exception:
-                        continue
-                if got_something:
-                    break
-
-            out_flags[i:i + CHUNK] = flags_chunk
-            if any(v is not None for v in flags_chunk):
-                failed_all = False
-
-    return out_flags, failed_all
-
-# --------- Coleta até atingir meta (sem travar event loop) ---------
-async def collect_until_target(
-    nicho: str, local: str, n: int, verify: int
-) -> Tuple[List[str], int, int, bool, bool]:
+def _collect_and_maybe_verify(nicho: str, local: str, n: int, verify: bool):
     """
-    Retorna: (final_list, searched_total, non_wa_count, exhausted_all, verify_failed)
+    Estratégia:
+      - overfetch inicial (3x) para reduzir iterações
+      - verifica em lote (se verify=1)
+      - se faltar, tenta novas coletas até bater n ou esgotar
     """
-    state = init_state(local)
-    pool: List[str] = []
-    seen = set()
-    exhausted_all = False
-    non_wa_count = 0
-    verify_failed = False
+    target = n
+    total_wa: List[str] = []
+    total_nonwa = 0
+    searched_acc = 0
+    exhausted_flag = False
 
-    while True:
-        # roda o coletor síncrono em thread separada
-        batch, state, exhausted = await to_thread.run_sync(collect_batch, nicho, state, max(n, 10))
-        exhausted_all = exhausted_all or exhausted
+    # para evitar duplicados em múltiplas rodadas de coleta
+    already_seen: set[str] = set()
 
-        for t in batch:
-            if t not in seen:
-                seen.add(t)
-                pool.append(t)
+    # no máximo 6 iterações de busca (suficiente para 500 com overfetch)
+    for _ in range(6):
+        if len(total_wa) >= target:
+            break
 
-        searched = len(pool)
+        need = target - len(total_wa)
+        overfetch = max(60, min(600, need * 3))
+        # coleta
+        phones, exhausted, searched = collect_numbers_ex(nicho, local, overfetch)
+        searched_acc += searched
 
-        if verify == 0:
-            if searched >= n or exhausted_all:
-                return pool[:n], searched, 0, exhausted_all, False
+        # filtra duplicados
+        fresh = [p for p in phones if p not in already_seen]
+        for p in fresh:
+            already_seen.add(p)
+
+        if not fresh and exhausted:
+            exhausted_flag = True
+            break
+
+        if verify:
+            mask = check_whatsapp_bulk(fresh)
+            wa_now = [p for p in fresh if mask.get(p, False)]
+            non_wa_now = len(fresh) - len(wa_now)
+            total_nonwa += non_wa_now
+            total_wa.extend(wa_now)
         else:
-            if searched >= n or exhausted_all:
-                flags, failed = await bulk_check_whatsapp(pool)
-                verify_failed = failed
+            total_wa.extend(fresh)
 
-                wa = [p for p, ok in zip(pool, flags) if ok is True]
-                non_wa_count = sum(1 for ok in flags if ok is False)
+        if exhausted and len(total_wa) < target:
+            exhausted_flag = True
+            break
 
-                if len(wa) >= n or exhausted_all:
-                    return wa[:n], searched, non_wa_count, exhausted_all, verify_failed
+    # corta no alvo
+    total_wa = total_wa[:target]
+    wa_count = len(total_wa)
+    return total_wa, searched_acc, total_nonwa, exhausted_flag
 
-        if exhausted_all:
-            # acabou a fonte e não atingiu a meta
-            return (pool[:n] if verify == 0 else []), searched, non_wa_count, exhausted_all, verify_failed
-
-# --------- Endpoints ---------
+# ====== Endpoints ======
 @app.get("/health")
 def health():
     return {"ok": True}
 
 @app.get("/leads")
-async def leads(
+def leads(
     nicho: str = Query(...),
     local: str = Query(...),
     n: int = Query(50, ge=1, le=500),
-    verify: int = Query(0, ge=0, le=1),
+    verify: int = Query(0, description="1 para verificar WhatsApp em lote; 0 para não verificar"),
 ):
-    try:
-        final_list, searched_total, non_wa_count, exhausted, verify_failed = await collect_until_target(
-            nicho, local, n, verify
-        )
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"collector_error: {type(e).__name__}: {e}")
+    verify_bool = bool(verify)
+    phones, searched_acc, non_wa_count, exhausted = _collect_and_maybe_verify(nicho, local, n, verify_bool)
 
-    if verify == 1:
-        items = [{"phone": p, "has_whatsapp": True} for p in final_list]
-        wa_count = len(items)
-    else:
-        items = [{"phone": p} for p in final_list]
-        wa_count = 0
+    mask = None
+    if verify_bool:
+        # já filtramos no _collect_and_maybe_verify; marcar has_whatsapp=True
+        mask = {p: True for p in phones}
 
-    return {
-        "count": len(items),
-        "items": items,
-        "searched": searched_total,
-        "wa_count": wa_count,
-        "non_wa_count": non_wa_count,
-        "exhausted": exhausted,
-        "verify_failed": verify_failed,
-    }
+    items = _json_items(phones, mask)
+    return JSONResponse(
+        {
+            "count": len(items),
+            "items": items,
+            "wa_count": len(phones),
+            "non_wa_count": non_wa_count,
+            "searched": searched_acc,
+            "exhausted": exhausted or (len(items) < n),
+        }
+    )
 
 @app.get("/leads/stream")
-async def leads_stream(
+def leads_stream(
     nicho: str = Query(...),
     local: str = Query(...),
     n: int = Query(50, ge=1, le=500),
-    verify: int = Query(0, ge=0, le=1),
+    verify: int = Query(0),
 ):
-    async def gen() -> AsyncGenerator[bytes, None]:
+    verify_bool = bool(verify)
+
+    def gen() -> Iterable[bytes]:
+        # start
         yield b"event: start\ndata: {}\n\n"
-        try:
-            final_list, searched_total, non_wa_count, exhausted, verify_failed = await collect_until_target(
-                nicho, local, n, verify
-            )
-            wa_count = len(final_list) if verify == 1 else 0
 
-            prog = {"searched": searched_total, "wa_count": wa_count, "non_wa_count": non_wa_count}
-            yield f"event: progress\ndata: {json.dumps(prog, ensure_ascii=False)}\n\n".encode()
+        phones, searched_acc, non_wa_count, exhausted = _collect_and_maybe_verify(nicho, local, n, verify_bool)
 
-            for p in final_list:
-                payload = {"phone": p}
-                if verify == 1:
-                    payload["has_whatsapp"] = True
-                yield f"event: item\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode()
+        # envia itens (como streaming visual)
+        for p in phones:
+            payload = {"phone": p, "has_whatsapp": True if verify_bool else None}
+            yield f"event: item\ndata: {json.dumps(payload, ensure_ascii=False)}\n\n".encode("utf-8")
 
-            done = {
-                "count": len(final_list),
-                "searched": searched_total,
-                "wa_count": wa_count,
-                "non_wa_count": non_wa_count,
-                "exhausted": exhausted,
-                "verify_failed": verify_failed,
-            }
-            yield f"event: done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n".encode()
-        except Exception as e:
-            err = {"error": f"{type(e).__name__}: {e}"}
-            yield f"event: error\ndata: {json.dumps(err, ensure_ascii=False)}\n\n".encode()
+        # progress/done
+        progress = {
+            "searched": searched_acc,
+            "wa_count": len(phones),
+            "non_wa_count": non_wa_count,
+        }
+        yield f"event: progress\ndata: {json.dumps(progress, ensure_ascii=False)}\n\n".encode("utf-8")
 
-    headers = {
-        "Cache-Control": "no-cache",
-        "Content-Type": "text/event-stream",
-        "Connection": "keep-alive",
-        "Access-Control-Allow-Origin": "*",
-    }
-    return StreamingResponse(gen(), headers=headers)
+        done = {
+            "count": len(phones),
+            "wa_count": len(phones),
+            "non_wa_count": non_wa_count,
+            "searched": searched_acc,
+            "exhausted": exhausted or (len(phones) < n),
+        }
+        yield f"event: done\ndata: {json.dumps(done, ensure_ascii=False)}\n\n".encode("utf-8")
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
