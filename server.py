@@ -23,23 +23,22 @@ def _env_int(name: str, default: int) -> int:
 UAZAPI_CHECK_URL        = (os.getenv("UAZAPI_CHECK_URL", "") or "").strip().rstrip("/")
 UAZAPI_INSTANCE_TOKEN   = (os.getenv("UAZAPI_INSTANCE_TOKEN", "") or "").strip()
 
-UAZAPI_BATCH_SIZE       = _env_int("UAZAPI_BATCH_SIZE", 50)          # <= 100 da doc funciona bem
-UAZAPI_MAX_CONCURRENCY  = _env_int("UAZAPI_MAX_CONCURRENCY", 3)
+UAZAPI_BATCH_SIZE       = _env_int("UAZAPI_BATCH_SIZE", 50)
+UAZAPI_MAX_CONCURRENCY  = _env_int("UAZAPI_MAX_CONCURRENCY", 3)   # usado só no /leads (não-stream)
 UAZAPI_RETRIES          = _env_int("UAZAPI_RETRIES", 2)
 UAZAPI_THROTTLE_MS      = _env_int("UAZAPI_THROTTLE_MS", 120)
 UAZAPI_TIMEOUT          = _env_int("UAZAPI_TIMEOUT", 12)
 OVERSCAN_MULT           = _env_int("OVERSCAN_MULT", 8)
 
-# normaliza URL: se vier só domínio, acrescenta /chat/check
+# Se vier só domínio, acrescenta /chat/check
 if UAZAPI_CHECK_URL and not UAZAPI_CHECK_URL.endswith("/chat/check"):
-    # se já tem caminho diferente, mantemos; se é puro domínio, anexa
     if UAZAPI_CHECK_URL.count("/") <= 2:  # https://host
         UAZAPI_CHECK_URL = UAZAPI_CHECK_URL + "/chat/check"
 
 # -----------------------------------------------------------------------------
 # App
 # -----------------------------------------------------------------------------
-app = FastAPI(title="Lead Extractor API", version="2.2.0")
+app = FastAPI(title="Lead Extractor API", version="2.2.1")
 
 app.add_middleware(
     CORSMiddleware,
@@ -50,7 +49,7 @@ app.add_middleware(
 )
 
 # -----------------------------------------------------------------------------
-# Util
+# Utils
 # -----------------------------------------------------------------------------
 def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
@@ -66,116 +65,98 @@ def _truthy(v) -> bool:
 
 def _split_chunks(seq: Iterable[str], size: int) -> List[List[str]]:
     seq = list(seq)
-    return [seq[i:i+size] for i in range(0, len(seq), max(1, size))]
+    size = max(1, size)
+    return [seq[i:i+size] for i in range(0, len(seq), size)]
+
+def _sse(event: str, data: dict) -> bytes:
+    msg = f"event: {event}\n" f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
+    return msg.encode("utf-8")
 
 # -----------------------------------------------------------------------------
-# Verificação WhatsApp (robusta a formatos da API)
+# Verificação WhatsApp
 # -----------------------------------------------------------------------------
-async def _verify_batch(
-    client: httpx.AsyncClient,
-    digits: List[str],
-) -> Tuple[set, Dict]:
-    """
-    Envia um único lote (digits somente) para a UAZAPI.
-    Retorna (set_e164_wa, meta_parcial).
-    """
-    wa_plus: set = set()
-    meta = {"sent": len(digits), "ok": 0, "fail": 0}
-
-    if not digits:
-        return wa_plus, meta
-
+async def _verify_batch_once(client: httpx.AsyncClient, digits: List[str]) -> List[Dict]:
+    """Chama a API 1x e retorna a lista bruta padronizada."""
     payload = {"numbers": digits}
     headers = {"Content-Type": "application/json", "token": UAZAPI_INSTANCE_TOKEN}
+    r = await client.post(UAZAPI_CHECK_URL, json=payload, headers=headers)
+    r.raise_for_status()
+    data = r.json()
+    rows = []
+    if isinstance(data, list):
+        rows = data
+    elif isinstance(data, dict):
+        rows = data.get("data") or data.get("numbers") or []
+        if isinstance(rows, dict):
+            rows = rows.get("numbers", [])
+    return rows if isinstance(rows, list) else []
 
-    # retentativas com backoff simples
+async def _verify_batch_retry(client: httpx.AsyncClient, digits: List[str]) -> List[Dict]:
     attempt = 0
     last_exc = None
     while attempt <= UAZAPI_RETRIES:
         try:
-            r = await client.post(UAZAPI_CHECK_URL, json=payload, headers=headers)
-            r.raise_for_status()
-            data = r.json()
-            meta["ok"] += 1
-            rows = []
-            if isinstance(data, list):
-                rows = data
-            elif isinstance(data, dict):
-                rows = data.get("data") or data.get("numbers") or []
-                if isinstance(rows, dict):
-                    rows = rows.get("numbers", [])
-
-            for item in rows:
-                q = str(item.get("query") or item.get("number") or item.get("phone") or "")
-                qd = _digits(q)
-                is_wa = (
-                    _truthy(item.get("isInWhatsapp"))
-                    or _truthy(item.get("is_whatsapp"))
-                    or _truthy(item.get("exists"))
-                    or _truthy(item.get("valid"))
-                    or bool(item.get("jid"))           # jid preenchido é bom indício
-                    or bool(str(item.get("verifiedName") or "").strip())
-                )
-                if is_wa and qd:
-                    # devolvemos em E.164
-                    wa_plus.add("+" + qd)
-            return wa_plus, meta
+            return await _verify_batch_once(client, digits)
         except Exception as e:
             last_exc = e
-            meta["fail"] += 1
-            # backoff pequeno + throttle
-            await asyncio.sleep(0.4 + 0.15 * attempt)
+            await asyncio.sleep(0.4 + 0.2 * attempt)
             attempt += 1
-
-    # falhou todas
-    return wa_plus, meta
+    # Falhou tudo
+    return []
 
 async def verify_whatsapp(numbers_e164: List[str]) -> Tuple[set, Dict]:
     """
-    Recebe números em E.164 (+55...), envia apenas dígitos para a UAZAPI
-    em lotes, com paralelismo limitado, retentativas e throttle.
-    Retorna (set_e164_wa, meta_info).
+    Recebe E.164; envia dígitos por lotes; retorna (set_e164_com_WA, meta).
+    (Usada pelo endpoint /leads NÃO-stream; pode usar paralelismo moderado.)
     """
-    meta_all = {"batches": 0, "sent": 0, "ok": 0, "fail": 0}
+    meta = {"batches": 0, "sent": 0, "ok": 0, "fail": 0}
     if not numbers_e164 or not UAZAPI_CHECK_URL or not UAZAPI_INSTANCE_TOKEN:
-        return set(), meta_all
+        return set(), meta
 
-    # mapeia dígitos <-> e164
-    digits_list = []
-    e164_by_digits = {}
+    # Mapa dígitos -> E164
+    e164_by_digits: Dict[str, str] = {}
+    digits_all: List[str] = []
     for n in numbers_e164:
         d = _digits(n)
-        if not d:
-            continue
-        digits_list.append(d)
-        e164_by_digits[d] = n if n.startswith("+") else f"+{d}"
+        if d:
+            e164_by_digits[d] = n if n.startswith("+") else f"+{d}"
+            digits_all.append(d)
 
-    chunks = _split_chunks(digits_list, UAZAPI_BATCH_SIZE)
-    meta_all["batches"] = len(chunks)
-    meta_all["sent"] = len(digits_list)
+    chunks = _split_chunks(digits_all, UAZAPI_BATCH_SIZE)
+    meta["batches"] = len(chunks)
+    meta["sent"] = len(digits_all)
 
     sem = asyncio.Semaphore(max(1, UAZAPI_MAX_CONCURRENCY))
     wa_all: set = set()
 
     async with httpx.AsyncClient(timeout=UAZAPI_TIMEOUT) as client:
         async def worker(batch: List[str]):
+            nonlocal wa_all
             async with sem:
-                wa_set, meta = await _verify_batch(client, batch)
-                # normaliza resultado para e164 usando e164_by_digits
-                for w in wa_set:
-                    d = _digits(w)
-                    if d in e164_by_digits:
-                        wa_all.add(e164_by_digits[d])
-                meta_all["ok"] += meta["ok"]
-                meta_all["fail"] += meta["fail"]
-                # throttle leve entre chamadas
+                rows = await _verify_batch_retry(client, batch)
+                ok = 1 if rows else 0
+                meta["ok"] += ok
+                meta["fail"] += (1 - ok)
+                for item in rows:
+                    q = str(item.get("query") or item.get("number") or item.get("phone") or "")
+                    qd = _digits(q)
+                    is_wa = (
+                        _truthy(item.get("isInWhatsapp"))
+                        or _truthy(item.get("is_whatsapp"))
+                        or _truthy(item.get("exists"))
+                        or _truthy(item.get("valid"))
+                        or bool(item.get("jid"))
+                        or bool(str(item.get("verifiedName") or "").strip())
+                    )
+                    if is_wa and qd in e164_by_digits:
+                        wa_all.add(e164_by_digits[qd])
                 await asyncio.sleep(UAZAPI_THROTTLE_MS / 1000.0)
 
         tasks = [asyncio.create_task(worker(b)) for b in chunks]
         if tasks:
             await asyncio.gather(*tasks)
 
-    return wa_all, meta_all
+    return wa_all, meta
 
 # -----------------------------------------------------------------------------
 # Endpoints
@@ -183,9 +164,6 @@ async def verify_whatsapp(numbers_e164: List[str]) -> Tuple[set, Dict]:
 @app.get("/health")
 def health():
     return {"ok": True}
-
-def _sse(event: str, data: dict) -> bytes:
-    return f"event: {event}\n" + f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
 
 @app.get("/leads")
 async def leads(
@@ -220,7 +198,7 @@ async def leads(
             "wa_meta": wa_meta,
         }
 
-    # sem verificação
+    # Sem verificação
     items = candidates[:n]
     return {
         "count": len(items),
@@ -271,63 +249,53 @@ async def leads_stream(
             )
             return
 
-        # com verificação: por lotes (feedback contínuo)
-        wa_total: List[str] = []
+        # com verificação: processa lotes sequencialmente (estável p/ SSE)
+        wa_list: List[str] = []
         wa_count = 0
         non_wa_count = 0
-        wa_meta_total = {"batches": 0, "sent": 0, "ok": 0, "fail": 0}
 
         chunks = _split_chunks(candidates, UAZAPI_BATCH_SIZE)
-        wa_meta_total["batches"] = len(chunks)
-        wa_meta_total["sent"] = len(candidates)
-
-        # Aplica o mesmo paralelismo, mas vamos emitir progresso após cada batch concluído
-        sem = asyncio.Semaphore(max(1, UAZAPI_MAX_CONCURRENCY))
-
         async with httpx.AsyncClient(timeout=UAZAPI_TIMEOUT) as client:
-            async def proc_batch(batch: List[str]):
-                nonlocal wa_count, non_wa_count, wa_total, wa_meta_total
-                async with sem:
-                    # mapeia batch -> dígitos
-                    dmap = [_digits(x) for x in batch if _digits(x)]
-                    sub_wa_set, meta = await _verify_batch(client, dmap)
-                    wa_meta_total["ok"] += meta["ok"]
-                    wa_meta_total["fail"] += meta["fail"]
-                    # normaliza e envia itens
-                    batch_wa = set()
-                    for w in sub_wa_set:
-                        d = _digits(w)
-                        # recupera E164 original que pertence a este batch
-                        for cand in batch:
-                            if _digits(cand) == d:
-                                batch_wa.add(cand)
-                                break
-                    # itens
-                    for p in batch:
-                        if p in batch_wa:
-                            if len(wa_total) < n:
-                                wa_total.append(p)
-                                wa_count += 1
-                                yield _sse("item", {"phone": p, "has_whatsapp": True})
-                        else:
-                            non_wa_count += 1
-                    # progresso
-                    yield _sse(
-                        "progress",
-                        {"searched": searched, "wa_count": wa_count, "non_wa_count": non_wa_count},
+            for batch in chunks:
+                # mapeia batch -> dígitos
+                dlist = [_digits(x) for x in batch if _digits(x)]
+                rows = await _verify_batch_retry(client, dlist)
+
+                batch_wa_digits = set()
+                for item in rows:
+                    q = str(item.get("query") or item.get("number") or item.get("phone") or "")
+                    qd = _digits(q)
+                    is_wa = (
+                        _truthy(item.get("isInWhatsapp"))
+                        or _truthy(item.get("is_whatsapp"))
+                        or _truthy(item.get("exists"))
+                        or _truthy(item.get("valid"))
+                        or bool(item.get("jid"))
+                        or bool(str(item.get("verifiedName") or "").strip())
                     )
-                    await asyncio.sleep(UAZAPI_THROTTLE_MS / 1000.0)
+                    if is_wa and qd:
+                        batch_wa_digits.add(qd)
 
-            # processa batches em paralelo limitado, na ordem de término
-            # (mantém envio de progresso mesmo com paralelismo)
-            for i in range(0, len(chunks), UAZAPI_MAX_CONCURRENCY):
-                group = chunks[i : i + UAZAPI_MAX_CONCURRENCY]
-                # roda o grupo e encaminha eventos conforme acabam
-                coros = [proc_batch(b) async for b in _as_async_gen(group, proc_batch)]
-                # o helper acima já yielda; aqui seguimos para o próximo grupo
-                # mas precisamos limitar listagem: implementamos abaixo
+                # emite itens: apenas WA (até n)
+                for p in batch:
+                    if _digits(p) in batch_wa_digits:
+                        if len(wa_list) < n:
+                            wa_list.append(p)
+                            wa_count += 1
+                            yield _sse("item", {"phone": p, "has_whatsapp": True})
+                    else:
+                        non_wa_count += 1
 
-        # done
+                # progresso parcial
+                yield _sse("progress", {"searched": searched, "wa_count": wa_count, "non_wa_count": non_wa_count})
+
+                # throttle leve
+                await asyncio.sleep(UAZAPI_THROTTLE_MS / 1000.0)
+
+                # se já atingiu a meta
+                if len(wa_list) >= n:
+                    break
+
         exhausted = exhausted_all and (wa_count < n)
         yield _sse(
             "done",
@@ -337,14 +305,7 @@ async def leads_stream(
                 "non_wa_count": non_wa_count,
                 "searched": searched,
                 "exhausted": exhausted,
-                "wa_meta": wa_meta_total,
             },
         )
 
-    # helper: transforma lista de batches em gerador que executa e repassa os yields
-    async def _as_async_gen(batches: List[List[str]], fn):
-        for b in batches:
-            async for ev in fn(b):   # fn(b) é um async generator (proc_batch)
-                yield ev
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    return StreamingResponse(gen(), media_type="text/event-stream; charset=utf-8")
