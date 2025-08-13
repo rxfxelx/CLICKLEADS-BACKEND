@@ -1,134 +1,134 @@
-# collector.py
 import re
 import time
 import urllib.parse
-from typing import Dict, List, Set, Tuple
-
+from typing import List, Set, Tuple
 import phonenumbers
-from playwright.sync_api import (
-    sync_playwright,
-    TimeoutError as PWTimeoutError,
-)
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
 
-# Regex genérica para capturar possíveis telefones e deixar a
-# validação/normalização para o phonenumbers (Brasil)
-PHONE_RE = re.compile(r"\+?(\d[\d .()\-]{8,}\d)")
+PHONE_RE = re.compile(r"\(?\d{2}\)?\s?\d{4,5}[-.\s]?\d{4}")
 
-
-def norm_br_e164(raw: str) -> str | None:
-    """Normaliza qualquer telefone detectado para +E164 Brasil (+55...)."""
+def norm_br_e164(raw: str):
     d = re.sub(r"\D", "", raw or "")
     if not d:
         return None
     if not d.startswith("55"):
         d = "55" + d.lstrip("0")
     try:
-        num = phonenumbers.parse("+" + d, None)
-        if phonenumbers.is_possible_number(num) and phonenumbers.is_valid_number(num):
-            return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+        n = phonenumbers.parse("+" + d, None)
+        if phonenumbers.is_possible_number(n) and phonenumbers.is_valid_number(n):
+            return phonenumbers.format_number(n, phonenumbers.PhoneNumberFormat.E164)
     except Exception:
         pass
     return None
 
+def _is_block(page) -> bool:
+    try:
+        txt = (page.title() or "") + " " + (page.inner_text("body") or "")
+        txt = txt.lower()
+        if "unusual traffic" in txt or "captcha" in txt or "/sorry/" in (page.url or ""):
+            return True
+    except Exception:
+        pass
+    return False
 
-def _accept_consent(page) -> None:
-    """Fecha banners de consentimento do Google quando aparecerem."""
-    sels = [
-        "#L2AGLb",
-        "button:has-text('Aceitar tudo')",
-        "button:has-text('Concordo')",
-        "button:has-text('I agree')",
-        "div[role=button]:has-text('Aceitar tudo')",
-    ]
-    for sel in sels:
-        try:
-            btn = page.locator(sel)
-            if btn.count():
-                btn.first.click(timeout=2000)
-                page.wait_for_timeout(200)
-                break
-        except Exception:
-            pass
+def _scrape_page_numbers(page) -> Set[str]:
+    found: Set[str] = set()
+    # 1) links tel:
+    try:
+        for el in page.locator("a[href^='tel:']").all():
+            href = (el.get_attribute("href") or "")[4:]
+            tel = norm_br_e164(href)
+            if tel:
+                found.add(tel)
+    except Exception:
+        pass
+    # 2) regex no body
+    try:
+        body = page.inner_text("body") or ""
+        for m in PHONE_RE.findall(body):
+            tel = norm_br_e164(m)
+            if tel:
+                found.add(tel)
+    except Exception:
+        pass
+    return found
 
-
-def _numbers_from_local_page(page) -> List[str]:
+def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int = 8) -> Tuple[List[str], bool]:
     """
-    Extrai números da página local do Google:
-      1) <a href="tel:...">
-      2) Regex no texto do body (cartões + painel lateral)
+    Coleta números candidatos (E.164) no Google Local.
+    Retorna (lista_candidatos, exhausted_all)
+    - overscan_mult: quanto acima do alvo tentar coletar (para compensar filtro WA).
     """
+    target_pool = max(alvo * overscan_mult, alvo)  # coletar um pool maior
     out: List[str] = []
     seen: Set[str] = set()
+    exhausted_all = True
 
-    # 1) Ancoras tel:
+    cidades = [c.strip() for c in (local or "").split(",") if c.strip()]
+    if not cidades:
+        cidades = [local.strip()]
+
     try:
-        for a in page.locator('a[href^="tel:"]').all():
-            raw = (a.get_attribute("href") or "").replace("tel:", "")
-            tel = norm_br_e164(raw)
-            if tel and tel not in seen:
-                seen.add(tel)
-                out.append(tel)
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+            ctx = browser.new_context(
+                locale="pt-BR",
+                user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
+            )
+            # bloquear assets pesados
+            ctx.route("**/*", lambda r: r.abort()
+                     if r.request.resource_type in {"image","font","media"}
+                     else r.continue_())
+            ctx.set_default_timeout(9000)
+            ctx.set_default_navigation_timeout(18000)
+
+            page = ctx.new_page()
+
+            for cidade in cidades:
+                start = 0
+                no_new_in_a_row = 0
+                while len(out) < target_pool:
+                    q = urllib.parse.quote(f"{nicho} {cidade}")
+                    url = f"https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={q}&start={start}"
+                    try:
+                        page.goto(url, wait_until="domcontentloaded", timeout=18000)
+                    except PWTimeoutError:
+                        break
+                    if _is_block(page):
+                        exhausted_all = False
+                        break
+
+                    before = len(seen)
+                    nums = _scrape_page_numbers(page)
+                    for tel in nums:
+                        if tel not in seen:
+                            seen.add(tel)
+                            out.append(tel)
+                            if len(out) >= target_pool:
+                                break
+
+                    # paginar
+                    added = len(seen) - before
+                    if added == 0:
+                        no_new_in_a_row += 1
+                    else:
+                        no_new_in_a_row = 0
+
+                    if no_new_in_a_row >= 2:
+                        break  # não está vindo mais nada novo
+
+                    start += 20
+                    time.sleep(0.5)
+
+                # se já temos pool suficiente, segue para verificação
+                if len(out) >= target_pool:
+                    break
+
+            ctx.close()
+            browser.close()
     except Exception:
-        pass
+        # em caso de erro, retorna o que tiver
+        return out, False
 
-    # 2) Regex no body
-    try:
-        blob = page.inner_text("body")
-        for m in PHONE_RE.findall(blob or ""):
-            tel = norm_br_e164(m)
-            if tel and tel not in seen:
-                seen.add(tel)
-                out.append(tel)
-    except Exception:
-        pass
-
-    return out
-
-
-def collect_numbers_for_city(
-    nicho: str,
-    city: str,
-    limit: int,
-    start: int,
-) -> Tuple[List[str], int, int, bool]:
-    """
-    Coleta até 'limit' números para UMA cidade, iniciando na paginação 'start'
-    (0, 20, 40...). Retorna:
-      (phones, searched, next_start, exhausted_city)
-
-    - phones: números únicos coletados (E.164)
-    - searched: quantidade de ocorrências lidas (aprox.)
-    - next_start: offset para próxima iteração nessa cidade
-    - exhausted_city: True se não há mais o que paginar/obter
-    """
-    phones: List[str] = []
-    searched = 0
-    exhausted_city = False
-
-    q = urllib.parse.quote(f"{nicho} {city}")
-
-    with sync_playwright() as p:
-        browser = p.chromium.launch(
-            headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-            ],
-        )
-        ctx = browser.new_context(
-            locale="pt-BR",
-            user_agent=(
-                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
-            ),
-            viewport={"width": 1280, "height": 800},
-        )
-        # Bloqueia recursos pesados para acelerar e reduzir chance de bloqueio
-        ctx.route(
-            "**/*",
-            lambda r: r.abort()
-            if r.request.resource_type in {"image", "font", "media"}
-            else r.continue_(),
-        )
-        ctx
-        
+    return out, exhausted_all
