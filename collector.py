@@ -1,32 +1,28 @@
-import os
-import re
-import time
-import random
-import urllib.parse
-from typing import Generator, Set
-
+import os, re, time, random, urllib.parse
+from typing import Dict, List, Set, Tuple
 import phonenumbers
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-# Regex BR no HTML dos resultados locais
+DEBUG = os.getenv("DEBUG", "0") == "1"
+def _dbg(*a): 
+    if DEBUG: print("[collector]", *a, flush=True)
+
 PHONE_RE = re.compile(r"\+?(\d[\d .()\-]{8,}\d)")
+UAS = [
+    ("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+    ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+     "(KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36"),
+]
 
-# ---------- ENV / perfis ----------
-BROWSER_POOL = [e.strip() for e in os.getenv("BROWSER_POOL", "chromium").split(",") if e.strip()]
-PROFILE_ROOT = os.getenv("PLAYWRIGHT_PROFILE_DIR", "/app/.pw-profiles")
-HEADLESS = os.getenv("HEADLESS", "1") != "0"
-TZ = os.getenv("PLAYWRIGHT_TZ", "America/Sao_Paulo")
-
-def norm_br_e164(raw: str) -> str | None:
+def norm_br_e164(raw: str) -> str|None:
     d = re.sub(r"\D", "", raw or "")
-    if not d:
-        return None
-    if not d.startswith("55"):
-        d = "55" + d.lstrip("0")
+    if not d: return None
+    if not d.startswith("55"): d = "55" + d.lstrip("0")
     try:
-        num = phonenumbers.parse("+" + d, None)
-        if phonenumbers.is_possible_number(num) and phonenumbers.is_valid_number(num):
-            return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+        n = phonenumbers.parse("+" + d, None)
+        if phonenumbers.is_possible_number(n) and phonenumbers.is_valid_number(n):
+            return phonenumbers.format_number(n, phonenumbers.PhoneNumberFormat.E164)
     except Exception:
         pass
     return None
@@ -39,174 +35,132 @@ def _accept_consent(page):
         "button:has-text('I agree')",
         "div[role=button]:has-text('Aceitar tudo')",
     ]
+    # main
     for sel in sels:
         try:
-            btn = page.locator(sel)
-            if btn.count():
-                btn.first.click(timeout=2000)
+            el = page.locator(sel)
+            if el.count():
+                el.first.click(timeout=2000)
                 page.wait_for_timeout(200)
-                break
+                return
         except Exception:
             pass
-
-def _is_blocked(page) -> bool:
-    """Detecta bloqueio Google e sai sem insistir (sem tentar contornar)."""
+    # iframes
     try:
-        u = page.url or ""
-        if "/sorry/" in u:
-            return True
-        txt = ((page.title() or "") + " " + (page.inner_text("body") or "")).lower()
-        for s in ("unusual traffic", "verify you are a human", "nossos sistemas detectaram",
-                  "activity from your system", "captcha"):
-            if s in txt:
-                return True
+        for f in page.frames:
+            for sel in sels:
+                try:
+                    el = f.locator(sel)
+                    if el.count():
+                        el.first.click(timeout=2000)
+                        page.wait_for_timeout(200)
+                        return
+                except Exception:
+                    continue
     except Exception:
         pass
-    return False
 
-def _numbers_from_page(page) -> Set[str]:
-    found: Set[str] = set()
-    # 1) links tel:
+def _numbers_from_page(page) -> List[str]:
+    out: List[str] = []; seen: Set[str] = set()
+    # tel: links
     try:
-        for el in page.locator('a[href^="tel:"]').all():
-            href = (el.get_attribute("href") or "")[4:]
-            tel = norm_br_e164(href)
-            if tel:
-                found.add(tel)
+        for a in page.locator('a[href^="tel:"]').all():
+            raw = (a.get_attribute("href") or "")[4:]
+            tel = norm_br_e164(raw)
+            if tel and tel not in seen:
+                seen.add(tel); out.append(tel)
     except Exception:
         pass
-    # 2) regex no corpo
+    # texto
     try:
-        body = page.inner_text("body") or ""
-        for m in PHONE_RE.findall(body):
+        body = page.inner_text("body")
+        for m in PHONE_RE.findall(body or ""):
             tel = norm_br_e164(m)
-            if tel:
-                found.add(tel)
+            if tel and tel not in seen:
+                seen.add(tel); out.append(tel)
     except Exception:
         pass
-    return found
+    return out
 
-def _pick_engine():
-    return random.choice(BROWSER_POOL or ["chromium"])
-
-def _random_ua():
-    UAS = [
-        # Chrome Win
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        # Firefox Linux
-        "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
-        # Safari Mac
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 "
-        "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
-    ]
-    return random.choice(UAS)
-
-def _random_viewport():
-    return {"width": random.randint(1200, 1440), "height": random.randint(800, 920)}
-
-def _launch_persistent_context(p):
-    engine = _pick_engine()
-    ua = _random_ua()
-    vp = _random_viewport()
-
-    profile_dir = os.path.join(PROFILE_ROOT, f"default-{engine}")
-    os.makedirs(profile_dir, exist_ok=True)
-
-    args = ["--no-sandbox", "--disable-dev-shm-usage"]
-    common_opts = dict(
-        headless=HEADLESS,
-        args=args,
+def _open_ctx(p):
+    ua = random.choice(UAS)
+    ctx = p.chromium.launch(
+        headless=True,
+        args=["--no-sandbox","--disable-dev-shm-usage","--disable-gpu"]
+    ).new_context(
         locale="pt-BR",
         user_agent=ua,
-        viewport=vp,
-        timezone_id=TZ,
+        timezone_id="America/Sao_Paulo",
     )
-
-    if engine == "firefox":
-        ctx = p.firefox.launch_persistent_context(profile_dir, **common_opts)
-    elif engine == "webkit":
-        ctx = p.webkit.launch_persistent_context(profile_dir, **common_opts)
-    else:
-        ctx = p.chromium.launch_persistent_context(profile_dir, **common_opts)
-
+    # bloqueia assets pesados
+    ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in {"image","font","media"} else r.continue_())
+    ctx.set_default_timeout(9000)
+    ctx.set_default_navigation_timeout(18000)
     return ctx
 
-def iter_numbers(nicho: str, local: str, max_total: int = 200, step: int = 40) -> Generator[str, None, None]:
-    """
-    Gera telefones (E.164) do Google Local (tbm=lcl) de forma incremental.
-    Estratégia anti-ruído:
-      * contexto persistente (cookies/consent salvos),
-      * engines sorteadas (chromium/firefox/webkit),
-      * UA/viewport randômicos,
-      * pausas com jitter,
-      * sem clicar em cards (menos eventos),
-      * detecção de bloqueio e saída limpa.
-    """
-    seen: Set[str] = set()
-    produced = 0
-    q = urllib.parse.quote(f"{nicho} {local}")
-    start = 0
-    empty_pages = 0
-    last_seen_len = 0
+def collect_numbers_for_city(nicho: str, city: str, want: int, start: int) -> Tuple[List[str], int, int, bool]:
+    """Varre o Local Finder daquela cidade, a partir de start (0,20,40...)."""
+    phones: List[str] = []; searched = 0; exhausted = False
+    q = urllib.parse.quote(f"{nicho} {city}")
+    _dbg(f"city={city} want={want} start={start}")
 
-    try:
-        with sync_playwright() as p:
-            ctx = _launch_persistent_context(p)
-            # corta assets pesados
-            ctx.route("**/*", lambda r: r.abort()
-                     if r.request.resource_type in {"image", "font", "media"}
-                     else r.continue_())
+    with sync_playwright() as p:
+        ctx = _open_ctx(p)
+        page = ctx.new_page()
+        cur = start
+        empty_streak = 0
+        last_len = -1
 
-            page = ctx.new_page()
-            page.set_default_timeout(9000)
-            page.set_default_navigation_timeout(18000)
+        while len(phones) < want:
+            url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={cur}"
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=18000)
+            except PWTimeoutError:
+                empty_streak += 1
+                if empty_streak >= 2: exhausted = True; break
+                cur += 20; continue
 
-            while produced < max_total:
-                url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={start}"
-                try:
-                    page.goto(url, wait_until="domcontentloaded", timeout=18000)
-                except PWTimeoutError:
-                    empty_pages += 1
-                    if empty_pages >= 2:
-                        break
-                    start += 20
-                    continue
+            _accept_consent(page)
+            try:
+                page.wait_for_selector("div[role='article'], div.VkpGBb, div[role='feed']", timeout=7000)
+            except PWTimeoutError:
+                pass
 
-                _accept_consent(page)
+            nums = _numbers_from_page(page)
+            searched += len(nums)
+            for t in nums:
+                if t not in phones:
+                    phones.append(t)
+                    if len(phones) >= want: break
 
-                if _is_blocked(page):
-                    break
+            if len(phones) == last_len:
+                empty_streak += 1
+            else:
+                empty_streak = 0
+                last_len = len(phones)
 
-                nums = _numbers_from_page(page)
-                added = 0
-                for tel in nums:
-                    if tel in seen:
-                        continue
-                    seen.add(tel)
-                    produced += 1
-                    added += 1
-                    yield tel
-                    if produced >= max_total:
-                        break
+            if empty_streak >= 3: exhausted = True; break
+            cur += 20
+            page.wait_for_timeout(400 + random.randint(60,160))  # respira
 
-                if added == 0:
-                    empty_pages += 1
-                else:
-                    empty_pages = 0
+        ctx.close()
+    _dbg(f"city={city} got={len(phones)} next={cur} exhausted={exhausted}")
+    return phones, searched, cur, exhausted
 
-                if last_seen_len == len(seen):
-                    empty_pages += 1
-                else:
-                    last_seen_len = len(seen)
-
-                if empty_pages >= 3:
-                    break
-
-                start += 20
-                # jitter ajuda a não formar “assinatura” de bot
-                time.sleep(0.45 + random.random() * 0.45)
-
-            ctx.close()
-    except Exception:
-        return
+def collect_numbers_batch(nicho: str, cities: List[str], limit: int, starts: Dict[str,int]|None=None) -> Tuple[List[str], int, Dict[str,int], bool]:
+    """Percorre as cidades na ordem, respeitando offsets por cidade."""
+    if starts is None: starts = {c:0 for c in cities}
+    result: List[str] = []; searched_total = 0; flags = {c:False for c in cities}
+    for c in cities:
+        if len(result) >= limit: break
+        if flags.get(c): continue
+        remaining = limit - len(result)
+        phones, searched, nxt, ex = collect_numbers_for_city(nicho, c, remaining, starts.get(c,0))
+        searched_total += searched
+        starts[c] = nxt; flags[c] = ex
+        for t in phones:
+            if t not in result:
+                result.append(t)
+                if len(result) >= limit: break
+    exhausted_all = all(flags.get(c,False) for c in cities)
+    return result, searched_total, starts, exhausted_all
