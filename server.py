@@ -11,9 +11,9 @@ from fastapi.responses import JSONResponse, StreamingResponse
 
 from collector import collect_numbers
 
-# -----------------------------------------------------------------------------
-# Config
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# ENV / helpers
+# -------------------------------------------------------------------
 def _env_int(name: str, default: int) -> int:
     try:
         return int(os.getenv(name, "").strip() or default)
@@ -24,43 +24,24 @@ UAZAPI_CHECK_URL        = (os.getenv("UAZAPI_CHECK_URL", "") or "").strip().rstr
 UAZAPI_INSTANCE_TOKEN   = (os.getenv("UAZAPI_INSTANCE_TOKEN", "") or "").strip()
 
 UAZAPI_BATCH_SIZE       = _env_int("UAZAPI_BATCH_SIZE", 50)
-UAZAPI_MAX_CONCURRENCY  = _env_int("UAZAPI_MAX_CONCURRENCY", 3)   # usado só no /leads (não-stream)
+UAZAPI_MAX_CONCURRENCY  = _env_int("UAZAPI_MAX_CONCURRENCY", 3)
 UAZAPI_RETRIES          = _env_int("UAZAPI_RETRIES", 2)
 UAZAPI_THROTTLE_MS      = _env_int("UAZAPI_THROTTLE_MS", 120)
 UAZAPI_TIMEOUT          = _env_int("UAZAPI_TIMEOUT", 12)
 OVERSCAN_MULT           = _env_int("OVERSCAN_MULT", 8)
 
-# Se vier só domínio, acrescenta /chat/check
+# Se veio só domínio, completa com /chat/check
 if UAZAPI_CHECK_URL and not UAZAPI_CHECK_URL.endswith("/chat/check"):
-    if UAZAPI_CHECK_URL.count("/") <= 2:  # https://host
+    if UAZAPI_CHECK_URL.count("/") <= 2:
         UAZAPI_CHECK_URL = UAZAPI_CHECK_URL + "/chat/check"
 
-# -----------------------------------------------------------------------------
-# App
-# -----------------------------------------------------------------------------
-app = FastAPI(title="Lead Extractor API", version="2.2.1")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r"^https://.*\.vercel\.app$",
-    allow_credentials=False,
-    allow_methods=["GET", "OPTIONS"],
-    allow_headers=["*"],
-)
-
-# -----------------------------------------------------------------------------
-# Utils
-# -----------------------------------------------------------------------------
 def _digits(s: str) -> str:
     return re.sub(r"\D", "", s or "")
 
 def _truthy(v) -> bool:
-    if isinstance(v, bool):
-        return v
-    if isinstance(v, (int, float)):
-        return v != 0
-    if isinstance(v, str):
-        return v.strip().lower() in {"true", "1", "yes", "y", "sim"}
+    if isinstance(v, bool): return v
+    if isinstance(v, (int, float)): return v != 0
+    if isinstance(v, str): return v.strip().lower() in {"true", "1", "yes", "y", "sim"}
     return False
 
 def _split_chunks(seq: Iterable[str], size: int) -> List[List[str]]:
@@ -69,14 +50,24 @@ def _split_chunks(seq: Iterable[str], size: int) -> List[List[str]]:
     return [seq[i:i+size] for i in range(0, len(seq), size)]
 
 def _sse(event: str, data: dict) -> bytes:
-    msg = f"event: {event}\n" f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-    return msg.encode("utf-8")
+    return (f"event: {event}\n" f"data: {json.dumps(data, ensure_ascii=False)}\n\n").encode("utf-8")
 
-# -----------------------------------------------------------------------------
-# Verificação WhatsApp
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
+# App
+# -------------------------------------------------------------------
+app = FastAPI(title="Lead Extractor API", version="3.0.0")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origin_regex=r"^https://.*\.vercel\.app$",
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"],
+)
+
+# -------------------------------------------------------------------
+# UAZAPI callers
+# -------------------------------------------------------------------
 async def _verify_batch_once(client: httpx.AsyncClient, digits: List[str]) -> List[Dict]:
-    """Chama a API 1x e retorna a lista bruta padronizada."""
     payload = {"numbers": digits}
     headers = {"Content-Type": "application/json", "token": UAZAPI_INSTANCE_TOKEN}
     r = await client.post(UAZAPI_CHECK_URL, json=payload, headers=headers)
@@ -92,28 +83,24 @@ async def _verify_batch_once(client: httpx.AsyncClient, digits: List[str]) -> Li
     return rows if isinstance(rows, list) else []
 
 async def _verify_batch_retry(client: httpx.AsyncClient, digits: List[str]) -> List[Dict]:
-    attempt = 0
     last_exc = None
-    while attempt <= UAZAPI_RETRIES:
+    for attempt in range(UAZAPI_RETRIES + 1):
         try:
             return await _verify_batch_once(client, digits)
         except Exception as e:
             last_exc = e
-            await asyncio.sleep(0.4 + 0.2 * attempt)
-            attempt += 1
-    # Falhou tudo
-    return []
+            await asyncio.sleep(0.4 + attempt * 0.2)
+    return []  # falhou
 
 async def verify_whatsapp(numbers_e164: List[str]) -> Tuple[set, Dict]:
     """
-    Recebe E.164; envia dígitos por lotes; retorna (set_e164_com_WA, meta).
-    (Usada pelo endpoint /leads NÃO-stream; pode usar paralelismo moderado.)
+    Modo REST (não-stream): paraleliza moderadamente (MAX_CONCURRENCY).
+    Retorna (set_e164_wa, meta).
     """
     meta = {"batches": 0, "sent": 0, "ok": 0, "fail": 0}
     if not numbers_e164 or not UAZAPI_CHECK_URL or not UAZAPI_INSTANCE_TOKEN:
         return set(), meta
 
-    # Mapa dígitos -> E164
     e164_by_digits: Dict[str, str] = {}
     digits_all: List[str] = []
     for n in numbers_e164:
@@ -158,9 +145,9 @@ async def verify_whatsapp(numbers_e164: List[str]) -> Tuple[set, Dict]:
 
     return wa_all, meta
 
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
 # Endpoints
-# -----------------------------------------------------------------------------
+# -------------------------------------------------------------------
 @app.get("/health")
 def health():
     return {"ok": True}
@@ -198,7 +185,6 @@ async def leads(
             "wa_meta": wa_meta,
         }
 
-    # Sem verificação
     items = candidates[:n]
     return {
         "count": len(items),
@@ -220,7 +206,7 @@ async def leads_stream(
         # start
         yield _sse("start", {})
 
-        # coleta (pool maior para compensar filtro WA)
+        # coleta
         try:
             loop = asyncio.get_running_loop()
             candidates, exhausted_all = await loop.run_in_executor(
@@ -232,24 +218,21 @@ async def leads_stream(
 
         searched = len(candidates)
 
-        # sem verificação: stream direto
+        # sem verificação
         if verify == 0:
             for p in candidates[:n]:
                 yield _sse("item", {"phone": p, "has_whatsapp": None})
             yield _sse("progress", {"searched": searched, "wa_count": 0, "non_wa_count": searched})
-            yield _sse(
-                "done",
-                {
-                    "count": min(n, len(candidates)),
-                    "wa_count": 0,
-                    "non_wa_count": searched,
-                    "searched": searched,
-                    "exhausted": exhausted_all and (len(candidates) < n),
-                },
-            )
+            yield _sse("done", {
+                "count": min(n, len(candidates)),
+                "wa_count": 0,
+                "non_wa_count": searched,
+                "searched": searched,
+                "exhausted": exhausted_all and (len(candidates) < n)
+            })
             return
 
-        # com verificação: processa lotes sequencialmente (estável p/ SSE)
+        # com verificação — sequencial (estável pro SSE)
         wa_list: List[str] = []
         wa_count = 0
         non_wa_count = 0
@@ -257,7 +240,6 @@ async def leads_stream(
         chunks = _split_chunks(candidates, UAZAPI_BATCH_SIZE)
         async with httpx.AsyncClient(timeout=UAZAPI_TIMEOUT) as client:
             for batch in chunks:
-                # mapeia batch -> dígitos
                 dlist = [_digits(x) for x in batch if _digits(x)]
                 rows = await _verify_batch_retry(client, dlist)
 
@@ -276,7 +258,6 @@ async def leads_stream(
                     if is_wa and qd:
                         batch_wa_digits.add(qd)
 
-                # emite itens: apenas WA (até n)
                 for p in batch:
                     if _digits(p) in batch_wa_digits:
                         if len(wa_list) < n:
@@ -286,26 +267,19 @@ async def leads_stream(
                     else:
                         non_wa_count += 1
 
-                # progresso parcial
                 yield _sse("progress", {"searched": searched, "wa_count": wa_count, "non_wa_count": non_wa_count})
-
-                # throttle leve
                 await asyncio.sleep(UAZAPI_THROTTLE_MS / 1000.0)
 
-                # se já atingiu a meta
                 if len(wa_list) >= n:
                     break
 
         exhausted = exhausted_all and (wa_count < n)
-        yield _sse(
-            "done",
-            {
-                "count": wa_count,
-                "wa_count": wa_count,
-                "non_wa_count": non_wa_count,
-                "searched": searched,
-                "exhausted": exhausted,
-            },
-        )
+        yield _sse("done", {
+            "count": wa_count,
+            "wa_count": wa_count,
+            "non_wa_count": non_wa_count,
+            "searched": searched,
+            "exhausted": exhausted
+        })
 
     return StreamingResponse(gen(), media_type="text/event-stream; charset=utf-8")
