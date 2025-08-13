@@ -1,181 +1,241 @@
-import os
 import re
-import time
-import urllib.parse
-from typing import List, Set, Tuple
+import json
+import asyncio
+from typing import AsyncGenerator, List, Dict, Any
 
-import phonenumbers
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from fastapi import FastAPI, Query, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
 
-# ----------------------------
-# Config via ENV (com defaults)
-# ----------------------------
-COLLECT_STEP = max(10, int(os.getenv("COLLECT_STEP", "20")))      # paginação do Google (múltiplos de 10/20)
-OVERSCAN_MULT_ENV = max(1, int(os.getenv("OVERSCAN_MULT", "6")))  # coleta mais que o pedido p/ compensar filtro WA
-HEADLESS = os.getenv("HEADLESS", "1") == "1"
-BROWSER_POOL = (os.getenv("BROWSER_POOL", "chromium") or "chromium").split(",")
-PLAYWRIGHT_TZ = os.getenv("PLAYWRIGHT_TZ", "America/Sao_Paulo")
-DEBUG_COLLECT = os.getenv("DEBUG_COLLECT", "0") == "1"
+from collector import collect_numbers
 
-# ----------------------------
-# Regex de telefone (Brasil)
-# ----------------------------
-PHONE_RE = re.compile(r"\+?(\d[\d .()\-]{8,}\d)")
+app = FastAPI(title="Lead Extractor API", version="2.2.0")
 
-def _log(msg: str) -> None:
-    if DEBUG_COLLECT:
-        print(f"[collector] {msg}", flush=True)
+# =========================
+# CORS: liberar geral (evita dor de cabeça no front)
+# =========================
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_methods=["GET", "OPTIONS"],
+    allow_headers=["*"],
+)
 
-def norm_br_e164(raw: str) -> str | None:
-    d = re.sub(r"\D", "", raw or "")
-    if not d:
-        return None
-    if not d.startswith("55"):
-        d = "55" + d.lstrip("0")
-    try:
-        num = phonenumbers.parse("+" + d, None)
-        if phonenumbers.is_possible_number(num) and phonenumbers.is_valid_number(num):
-            return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
-    except Exception:
-        pass
-    return None
+# =========================
+# UAZAPI (hardcoded)
+# =========================
+# Base sem /chat/check — o código completa a rota
+UAZAPI_CHECK_URL_BASE = "https://hia-clientes.uazapi.com"
+UAZAPI_INSTANCE_TOKEN = "55b903f3-9c7c-4457-9ffd-7296a35d832e"
 
-def _is_block(page) -> bool:
-    try:
-        txt = (page.title() or "") + " " + (page.inner_text("body") or "")
-        txt = txt.lower()
-        if "unusual traffic" in txt or "captcha" in txt or "/sorry/" in (page.url or ""):
-            return True
-    except Exception:
-        pass
-    return False
+# Tuning
+UAZAPI_BATCH_SIZE = 50
+UAZAPI_MAX_CONCURRENCY = 3
+UAZAPI_RETRIES = 2
+UAZAPI_THROTTLE_MS = 120
+UAZAPI_TIMEOUT = 12
 
-def _scrape_page_numbers(page) -> Set[str]:
-    found: Set[str] = set()
-    # 1) links tel:
-    try:
-        for el in page.locator("a[href^='tel:']").all():
-            href = (el.get_attribute("href") or "")[4:]
-            tel = norm_br_e164(href)
-            if tel:
-                found.add(tel)
-    except Exception:
-        pass
-    # 2) regex no body
-    try:
-        body = page.inner_text("body") or ""
-        for m in PHONE_RE.findall(body):
-            tel = norm_br_e164(m)
-            if tel:
-                found.add(tel)
-    except Exception:
-        pass
-    return found
+def _build_check_url() -> str:
+    base = (UAZAPI_CHECK_URL_BASE or "").rstrip("/")
+    return base if base.endswith("/chat/check") else f"{base}/chat/check"
 
-def _choose_browser(play) -> str:
-    # respeita BROWSER_POOL, mas prioriza chromium
-    for name in BROWSER_POOL:
-        name = name.strip().lower()
-        if name in ("chromium", "firefox", "webkit"):
-            return name
-    return "chromium"
+def _digits(n: str) -> str:
+    return re.sub(r"\D", "", n or "")
 
-def _launch_browser(p):
-    name = _choose_browser(p)
-    _log(f"launching browser={name} headless={HEADLESS}")
-    if name == "firefox":
-        return p.firefox.launch(headless=HEADLESS, args=["--no-sandbox", "--disable-dev-shm-usage"])
-    if name == "webkit":
-        return p.webkit.launch(headless=HEADLESS)
-    # default chromium
-    return p.chromium.launch(headless=HEADLESS, args=["--no-sandbox", "--disable-dev-shm-usage"])
+def _sse(event: str, data: Dict[str, Any]) -> bytes:
+    return (f"event: {event}\n" + f"data: {json.dumps(data, ensure_ascii=False)}\n\n").encode("utf-8")
 
-def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int | None = None) -> Tuple[List[str], bool]:
+# =========================
+# Verificação WhatsApp (robusta)
+# =========================
+async def verify_whatsapp(numbers: List[str]) -> set[str]:
     """
-    Coleta números candidatos (E.164) no Google Local.
-    Retorna (lista_candidatos, exhausted_all)
-    - overscan_mult: quanto acima do alvo tentar coletar (para compensar filtro WA).
+    Recebe E.164 (+55...), envia dígitos para UAZAPI e devolve set em E.164 dos que têm WA.
+    Usa token de instância via header 'token'.
+    Aceita várias formas de resposta:
+      - list
+      - {data: [...]}
+      - {numbers: [...]}
+      - {data: {numbers: [...]}}
+    Considera como WA se achar alguma das chaves: isInWhatsapp, is_whatsapp, exists, valid, whatsapp, inWhatsapp
     """
-    overscan = overscan_mult if overscan_mult and overscan_mult > 0 else OVERSCAN_MULT_ENV
-    target_pool = max(alvo * overscan, alvo)
-    out: List[str] = []
-    seen: Set[str] = set()
-    exhausted_all = True
+    url = _build_check_url()
+    if not numbers or not url or not UAZAPI_INSTANCE_TOKEN:
+        return set()
 
-    # suporta várias cidades separadas por vírgula
-    cidades = [c.strip() for c in (local or "").split(",") if c.strip()]
-    if not cidades:
-        cidades = [local.strip()]
+    # map dígitos -> E.164
+    dmap: Dict[str, str] = {}
+    for n in numbers:
+        d = _digits(n)
+        if d:
+            dmap[d] = n if n.startswith("+") else f"+{d}"
 
-    try:
-        with sync_playwright() as p:
-            browser = _launch_browser(p)
-            ctx = browser.new_context(
-                locale="pt-BR",
-                timezone_id=PLAYWRIGHT_TZ,
-                user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+    digits = list(dmap.keys())
+    if not digits:
+        return set()
+
+    wa_plus = set()
+    headers = {"Content-Type": "application/json", "token": UAZAPI_INSTANCE_TOKEN}
+
+    async def _post_batch(cx: httpx.AsyncClient, batch: List[str]) -> List[Dict[str, Any]]:
+        # retries + throttle
+        for _ in range(UAZAPI_RETRIES + 1):
+            try:
+                r = await cx.post(url, json={"numbers": batch}, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+                if isinstance(data, list):
+                    rows = data
+                elif isinstance(data, dict):
+                    rows = data.get("data") or data.get("numbers") or []
+                    if isinstance(rows, dict):
+                        rows = rows.get("numbers", [])
+                else:
+                    rows = []
+                if not isinstance(rows, list):
+                    rows = []
+                return rows
+            except Exception:
+                await asyncio.sleep(0.3)
+        return []
+
+    sem = asyncio.Semaphore(UAZAPI_MAX_CONCURRENCY)
+    async with httpx.AsyncClient(timeout=UAZAPI_TIMEOUT) as cx:
+        tasks = []
+        for i in range(0, len(digits), UAZAPI_BATCH_SIZE):
+            batch = digits[i : i + UAZAPI_BATCH_SIZE]
+            async def _job(b=batch):
+                async with sem:
+                    rows = await _post_batch(cx, b)
+                    if UAZAPI_THROTTLE_MS > 0:
+                        await asyncio.sleep(UAZAPI_THROTTLE_MS / 1000.0)
+                    return rows
+            tasks.append(asyncio.create_task(_job()))
+        all_rows_lists = await asyncio.gather(*tasks, return_exceptions=False)
+
+    for rows in all_rows_lists:
+        if not rows:
+            continue
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            q = str(item.get("query") or item.get("number") or item.get("phone") or "")
+            qd = _digits(q)
+            is_wa = bool(
+                item.get("isInWhatsapp")
+                or item.get("is_whatsapp")
+                or item.get("exists")
+                or item.get("valid")
+                or item.get("whatsapp")
+                or item.get("inWhatsapp")
             )
-            # bloquear assets pesados
-            ctx.route("**/*", lambda r: r.abort()
-                     if r.request.resource_type in {"image","font","media"}
-                     else r.continue_())
-            ctx.set_default_timeout(9000)
-            ctx.set_default_navigation_timeout(18000)
+            if is_wa and qd in dmap:
+                wa_plus.add(dmap[qd])
 
-            page = ctx.new_page()
+    return wa_plus
 
-            for cidade in cidades:
-                start = 0
-                no_new_in_a_row = 0
-                _log(f"city='{cidade}' target_pool={target_pool}")
-                while len(out) < target_pool:
-                    q = urllib.parse.quote(f"{nicho} {cidade}")
-                    url = f"https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={q}&start={start}"
-                    try:
-                        page.goto(url, wait_until="domcontentloaded", timeout=18000)
-                    except PWTimeoutError:
-                        _log("timeout on goto; moving next page")
-                        start += COLLECT_STEP
-                        continue
+# =========================
+# Endpoints
+# =========================
+@app.get("/health")
+def health():
+    return {"ok": True}
 
-                    if _is_block(page):
-                        _log("detected block/captcha; breaking city loop")
-                        exhausted_all = False
-                        break
-
-                    before = len(seen)
-                    nums = _scrape_page_numbers(page)
-                    for tel in nums:
-                        if tel not in seen:
-                            seen.add(tel)
-                            out.append(tel)
-                            if len(out) >= target_pool:
-                                break
-
-                    added = len(seen) - before
-                    _log(f"page start={start} added={added} total={len(out)}")
-
-                    if added == 0:
-                        no_new_in_a_row += 1
-                    else:
-                        no_new_in_a_row = 0
-
-                    if no_new_in_a_row >= 2:
-                        _log("no_new_in_a_row >= 2; breaking city loop")
-                        break  # não está vindo mais nada novo
-
-                    start += COLLECT_STEP
-                    time.sleep(0.5)  # respiro p/ evitar bloqueio
-
-                if len(out) >= target_pool:
-                    break
-
-            ctx.close()
-            browser.close()
+@app.get("/leads")
+async def leads(
+    nicho: str = Query(...),
+    local: str = Query(...),
+    n: int = Query(50, ge=1, le=500),
+    verify: int = Query(0, ge=0, le=1),
+):
+    try:
+        loop = asyncio.get_running_loop()
+        candidates, exhausted_all = await loop.run_in_executor(
+            None, lambda: collect_numbers(nicho, local, n, overscan_mult=None)
+        )
     except Exception as e:
-        _log(f"collector exception: {e!r}")
-        # em caso de erro, retorna o que tiver
-        return out, False
+        raise HTTPException(status_code=500, detail=f"collector_error: {type(e).__name__}")
 
-    return out, exhausted_all
+    searched = len(candidates)
+
+    if verify == 1:
+        wa_set = await verify_whatsapp(candidates)
+        items_wa = [p for p in candidates if p in wa_set][:n]
+        wa_count = len(items_wa)
+        non_wa_count = searched - wa_count
+        exhausted = exhausted_all and (wa_count < n)
+        return JSONResponse({
+            "count": wa_count,
+            "items": [{"phone": p, "has_whatsapp": True} for p in items_wa],
+            "searched": searched,
+            "wa_count": wa_count,
+            "non_wa_count": non_wa_count,
+            "exhausted": exhausted,
+        })
+
+    items = candidates[:n]
+    return JSONResponse({
+        "count": len(items),
+        "items": [{"phone": p, "has_whatsapp": None} for p in items],
+        "searched": searched,
+        "wa_count": 0,
+        "non_wa_count": searched,
+        "exhausted": exhausted_all and (len(items) < n),
+    })
+
+@app.get("/leads/stream")
+async def leads_stream(
+    nicho: str = Query(...),
+    local: str = Query(...),
+    n: int = Query(50, ge=1, le=500),
+    verify: int = Query(0, ge=0, le=1),
+):
+    async def gen() -> AsyncGenerator[bytes, None]:
+        yield _sse("start", {})
+
+        try:
+            loop = asyncio.get_running_loop()
+            candidates, exhausted_all = await loop.run_in_executor(
+                None, lambda: collect_numbers(nicho, local, n, overscan_mult=None)
+            )
+        except Exception as e:
+            yield _sse("error", {"error": f"collector_error: {type(e).__name__}"})
+            return
+
+        searched = len(candidates)
+
+        if verify == 1:
+            wa_set = await verify_whatsapp(candidates)
+            wa_list = [p for p in candidates if p in wa_set][:n]
+            wa_count = len(wa_list)
+            non_wa_count = searched - wa_count
+
+            yield _sse("progress", {"searched": searched, "wa_count": wa_count, "non_wa_count": non_wa_count})
+            for p in wa_list:
+                yield _sse("item", {"phone": p, "has_whatsapp": True})
+
+            exhausted = exhausted_all and (wa_count < n)
+            yield _sse("done", {
+                "count": wa_count,
+                "wa_count": wa_count,
+                "non_wa_count": non_wa_count,
+                "searched": searched,
+                "exhausted": exhausted
+            })
+            return
+
+        out = candidates[:n]
+        for p in out:
+            yield _sse("item", {"phone": p, "has_whatsapp": None})
+
+        yield _sse("progress", {"searched": searched, "wa_count": 0, "non_wa_count": searched})
+        yield _sse("done", {
+            "count": len(out),
+            "wa_count": 0,
+            "non_wa_count": searched,
+            "searched": searched,
+            "exhausted": exhausted_all and (len(out) < n)
+        })
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
