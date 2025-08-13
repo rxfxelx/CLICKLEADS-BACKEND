@@ -1,30 +1,27 @@
-import os
 import re
 import time
+import random
 import urllib.parse
 from typing import List, Set, Tuple
 
 import phonenumbers
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-# ----------------------------
-# Config via ENV (com defaults)
-# ----------------------------
-COLLECT_STEP = max(10, int(os.getenv("COLLECT_STEP", "20")))      # paginação do Google (múltiplos de 10/20)
-OVERSCAN_MULT_ENV = max(1, int(os.getenv("OVERSCAN_MULT", "6")))  # coleta mais que o pedido p/ compensar filtro WA
-HEADLESS = os.getenv("HEADLESS", "1") == "1"
-BROWSER_POOL = (os.getenv("BROWSER_POOL", "chromium") or "chromium").split(",")
-PLAYWRIGHT_TZ = os.getenv("PLAYWRIGHT_TZ", "America/Sao_Paulo")
-DEBUG_COLLECT = os.getenv("DEBUG_COLLECT", "0") == "1"
+# =========================
+# CONFIG (hardcoded)
+# =========================
+COLLECT_STEP = 20                 # paginação do Google (20 é padrão no Local)
+OVERSCAN_MULT = 6                 # coletar 6x o pedido para compensar filtro WA
+HEADLESS = True                   # headless no servidor
+BROWSER = "chromium"              # chromium | firefox | webkit
+PLAYWRIGHT_TZ = "America/Sao_Paulo"
+USER_AGENT = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+)
 
-# ----------------------------
-# Regex de telefone (Brasil)
-# ----------------------------
+# Regex de telefone BR (tolerante)
 PHONE_RE = re.compile(r"\+?(\d[\d .()\-]{8,}\d)")
-
-def _log(msg: str) -> None:
-    if DEBUG_COLLECT:
-        print(f"[collector] {msg}", flush=True)
 
 def norm_br_e164(raw: str) -> str | None:
     d = re.sub(r"\D", "", raw or "")
@@ -72,17 +69,8 @@ def _scrape_page_numbers(page) -> Set[str]:
         pass
     return found
 
-def _choose_browser(play) -> str:
-    # respeita BROWSER_POOL, mas prioriza chromium
-    for name in BROWSER_POOL:
-        name = name.strip().lower()
-        if name in ("chromium", "firefox", "webkit"):
-            return name
-    return "chromium"
-
 def _launch_browser(p):
-    name = _choose_browser(p)
-    _log(f"launching browser={name} headless={HEADLESS}")
+    name = (BROWSER or "chromium").strip().lower()
     if name == "firefox":
         return p.firefox.launch(headless=HEADLESS, args=["--no-sandbox", "--disable-dev-shm-usage"])
     if name == "webkit":
@@ -92,17 +80,16 @@ def _launch_browser(p):
 
 def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int | None = None) -> Tuple[List[str], bool]:
     """
-    Coleta números candidatos (E.164) no Google Local.
+    Coleta números candidatos (E.164) no Google Local (tbm=lcl) sem cliques.
     Retorna (lista_candidatos, exhausted_all)
-    - overscan_mult: quanto acima do alvo tentar coletar (para compensar filtro WA).
     """
-    overscan = overscan_mult if overscan_mult and overscan_mult > 0 else OVERSCAN_MULT_ENV
+    overscan = overscan_mult if overscan_mult and overscan_mult > 0 else OVERSCAN_MULT
     target_pool = max(alvo * overscan, alvo)
+
     out: List[str] = []
     seen: Set[str] = set()
     exhausted_all = True
 
-    # suporta várias cidades separadas por vírgula
     cidades = [c.strip() for c in (local or "").split(",") if c.strip()]
     if not cidades:
         cidades = [local.strip()]
@@ -113,13 +100,13 @@ def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int | None
             ctx = browser.new_context(
                 locale="pt-BR",
                 timezone_id=PLAYWRIGHT_TZ,
-                user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                            "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+                user_agent=USER_AGENT,
             )
             # bloquear assets pesados
-            ctx.route("**/*", lambda r: r.abort()
-                     if r.request.resource_type in {"image","font","media"}
-                     else r.continue_())
+            ctx.route(
+                "**/*",
+                lambda r: r.abort() if r.request.resource_type in {"image", "font", "media"} else r.continue_(),
+            )
             ctx.set_default_timeout(9000)
             ctx.set_default_navigation_timeout(18000)
 
@@ -128,21 +115,27 @@ def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int | None
             for cidade in cidades:
                 start = 0
                 no_new_in_a_row = 0
-                _log(f"city='{cidade}' target_pool={target_pool}")
+
                 while len(out) < target_pool:
                     q = urllib.parse.quote(f"{nicho} {cidade}")
                     url = f"https://www.google.com/search?tbm=lcl&hl=pt-BR&gl=BR&q={q}&start={start}"
+
                     try:
                         page.goto(url, wait_until="domcontentloaded", timeout=18000)
                     except PWTimeoutError:
-                        _log("timeout on goto; moving next page")
+                        # vai pra próxima página
                         start += COLLECT_STEP
                         continue
 
                     if _is_block(page):
-                        _log("detected block/captcha; breaking city loop")
                         exhausted_all = False
                         break
+
+                    # aguarda algo da lista (não é obrigatório, é só um hint)
+                    try:
+                        page.wait_for_selector("div[role='article'], div.VkpGBb, div[role='feed']", timeout=5000)
+                    except Exception:
+                        pass
 
                     before = len(seen)
                     nums = _scrape_page_numbers(page)
@@ -154,28 +147,24 @@ def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int | None
                                 break
 
                     added = len(seen) - before
-                    _log(f"page start={start} added={added} total={len(out)}")
-
                     if added == 0:
                         no_new_in_a_row += 1
                     else:
                         no_new_in_a_row = 0
 
                     if no_new_in_a_row >= 2:
-                        _log("no_new_in_a_row >= 2; breaking city loop")
                         break  # não está vindo mais nada novo
 
                     start += COLLECT_STEP
-                    time.sleep(0.5)  # respiro p/ evitar bloqueio
+                    # respiro com leve jitter para evitar bloqueio
+                    time.sleep(0.45 + random.random() * 0.25)
 
                 if len(out) >= target_pool:
                     break
 
             ctx.close()
             browser.close()
-    except Exception as e:
-        _log(f"collector exception: {e!r}")
-        # em caso de erro, retorna o que tiver
+    except Exception:
         return out, False
 
     return out, exhausted_all
