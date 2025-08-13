@@ -1,208 +1,229 @@
-import os, json, asyncio
-from typing import List, Dict, Any
-from fastapi import FastAPI, Query, HTTPException
-from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import StreamingResponse
-import httpx
-from anyio import to_thread
+import re
+import time
+import urllib.parse
+from typing import Dict, List, Set, Tuple
 
-from collector import collect_numbers_batch
+import phonenumbers
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-# DEBUG opcional
-DEBUG = os.getenv("DEBUG","0")=="1"
-def _dbg(*a):
-    if DEBUG: print("[server]", *a, flush=True)
+# ---- Regex / normalização ----
+PHONE_RE = re.compile(r"\+?(\d[\d .()\-]{8,}\d)")
 
-# ---------- App ----------
-app = FastAPI(title="Lead Extractor API", version="2.0.0")
-app.add_middleware(
-    CORSMiddleware,
-    allow_origin_regex=r".*",
-    allow_methods=["GET","OPTIONS"],
-    allow_headers=["*"],
-)
+def norm_br_e164(raw: str) -> str | None:
+    d = re.sub(r"\D", "", raw or "")
+    if not d:
+        return None
+    if not d.startswith("55"):
+        d = "55" + d.lstrip("0")
+    try:
+        num = phonenumbers.parse("+" + d, None)
+        if phonenumbers.is_possible_number(num) and phonenumbers.is_valid_number(num):
+            return phonenumbers.format_number(num, phonenumbers.PhoneNumberFormat.E164)
+    except Exception:
+        pass
+    return None
 
-# UAZAPI
-UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL","").rstrip("/")
-UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN","")
-
-# ---------- helpers ----------
-
-def _split_cities(local: str) -> List[str]:
-    # "BH, Contagem , Betim" -> ["BH","Contagem","Betim"]
-    return [c.strip() for c in local.split(",") if c.strip()]
-
-async def _uazapi_check_bulk(e164_list: List[str]) -> Dict[str,bool]:
-    """Retorna {+5511...: True/False}. Usa lotes de 100."""
-    if not (UAZAPI_CHECK_URL and UAZAPI_INSTANCE_TOKEN):
-        return {n: True for n in e164_list}  # sem verificação -> permite tudo
-
-    out: Dict[str,bool] = {}
-    url = UAZAPI_CHECK_URL
-    headers_variants = [
-        {"token": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
-        {"Authorization": f"Bearer {UAZAPI_INSTANCE_TOKEN}", "Content-Type": "application/json"},
-        {"apikey": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
+# ---- Consent do Google ----
+def _accept_consent(page):
+    sels = [
+        "#L2AGLb",
+        "button:has-text('Aceitar tudo')",
+        "button:has-text('Concordo')",
+        "button:has-text('I agree')",
+        "div[role=button]:has-text('Aceitar tudo')",
     ]
-
-    async with httpx.AsyncClient(timeout=30) as cx:
-        for i in range(0, len(e164_list), 100):
-            chunk = e164_list[i:i+100]
-            ok = False
-            for h in headers_variants:
-                try:
-                    r = await cx.post(url, json={"numbers": chunk}, headers=h)
-                    if not (200 <= r.status_code < 300):
-                        continue
-                    data = r.json()
-                    # lista simples
-                    if isinstance(data, list):
-                        for item in data:
-                            q = item.get("query") or item.get("number")
-                            out[q] = bool(item.get("isInWhatsapp") or item.get("is_whatsapp") or item.get("valid") or item.get("exists"))
-                        ok = True; break
-                    # dict com array
-                    arr = data.get("data") or data.get("numbers")
-                    if isinstance(arr, list):
-                        for item in arr:
-                            q = item.get("query") or item.get("number")
-                            out[q] = bool(item.get("isInWhatsapp") or item.get("is_whatsapp") or item.get("valid") or item.get("exists"))
-                        ok = True; break
-                except Exception as e:
-                    _dbg("uazapi chunk error:", type(e).__name__)
-            if not ok:
-                for n in chunk:
-                    out[n] = False
-    return out
-
-async def _collect_round(nicho: str, cities: List[str], want: int, starts: Dict[str,int]) -> Dict[str,Any]:
-    """Roda o coletor em thread pra não bloquear o loop."""
-    phones, searched, new_starts, exhausted = await to_thread.run_sync(
-        collect_numbers_batch, nicho, cities, want, starts
-    )
-    return {"phones": phones, "searched": searched, "starts": new_starts, "exhausted": exhausted}
-
-# ---------- endpoints ----------
-
-@app.get("/health")
-def health():
-    return {"ok": True}
-
-@app.get("/leads")
-async def leads(nicho: str = Query(...), local: str = Query(...), n: int = Query(50, ge=1, le=500), verify: int = Query(0)):
-    if not nicho.strip(): raise HTTPException(400, "nicho vazio")
-    if not local.strip(): raise HTTPException(400, "local vazio")
-    cities = _split_cities(local)
-    if not cities: raise HTTPException(400, "local inválido")
-
-    want = n
-    starts: Dict[str,int] = {c:0 for c in cities}
-    wa_only = verify == 1
-
-    wa_total = 0; non_wa_total = 0
-    collected: List[str] = []
-
-    while len(collected) < want:
-        round_need = max(50, want - len(collected))  # busca em blocos
-        r = await _collect_round(nicho, cities, round_need, starts)
-        starts = r["starts"]
-        found = r["phones"]
-        searched = r["searched"]
-        exhausted = r["exhausted"]
-        _dbg("round found=", len(found), "searched=", searched, "exhausted=", exhausted)
-
-        if not found:
-            return {"count": len(collected), "items":[{"phone":p} for p in collected],
-                    "searched": searched, "wa_count": wa_total, "non_wa_count": non_wa_total, "exhausted": True}
-
-        if wa_only:
-            verdicts = await _uazapi_check_bulk(found)
-            wa = [p for p in found if verdicts.get(p, False)]
-            nonwa = [p for p in found if not verdicts.get(p, False)]
-            wa_total += len(wa); non_wa_total += len(nonwa)
-            for p in wa:
-                if p not in collected:
-                    collected.append(p)
-                    if len(collected) >= want: break
-        else:
-            for p in found:
-                if p not in collected:
-                    collected.append(p)
-                    if len(collected) >= want: break
-
-        if exhausted and len(collected) < want:
-            break
-
-    return {
-        "count": len(collected),
-        "items": [{"phone": p} for p in collected],
-        "searched": len(collected),
-        "wa_count": wa_total,
-        "non_wa_count": non_wa_total,
-        "exhausted": len(collected) < want
-    }
-
-@app.get("/leads/stream")
-async def leads_stream(nicho: str = Query(...), local: str = Query(...), n: int = Query(50, ge=1, le=500), verify: int = Query(0)):
-
-    async def gen():
-        if not nicho.strip() or not local.strip():
-            yield "event: error\ndata: " + json.dumps({"error":"parâmetros inválidos"}) + "\n\n"; return
-
-        cities = _split_cities(local)
-        if not cities:
-            yield "event: error\ndata: " + json.dumps({"error":"local inválido"}) + "\n\n"; return
-
-        want = n; wa_only = verify == 1
-        starts = {c:0 for c in cities}
-        wa_total = 0; non_wa_total = 0
-        collected: List[str] = []
-        yield "event: start\ndata: {}\n\n"
-
+    for sel in sels:
         try:
-            while len(collected) < want:
-                round_need = max(50, want - len(collected))
-                r = await _collect_round(nicho, cities, round_need, starts)
-                starts = r["starts"]
-                found = r["phones"]
-                searched = r["searched"]
-                exhausted = r["exhausted"]
+            btn = page.locator(sel)
+            if btn.count():
+                btn.first.click(timeout=2000)
+                page.wait_for_timeout(200)
+                break
+        except Exception:
+            pass
 
-                yield "event: progress\ndata: " + json.dumps({
-                    "searched": searched, "wa_count": wa_total, "non_wa_count": non_wa_total
-                }) + "\n\n"
+# ---- Extração clicando nos cards (mais confiável para aparecer o telefone) ----
+def _extract_by_clicking(page, max_clicks: int = 25) -> List[str]:
+    found: List[str] = []
+    seen: Set[str] = set()
 
-                if not found:
+    cards = page.get_by_role("article")
+    if cards.count() == 0:
+        cards = page.locator("div.VkpGBb, div[role='article']")
+
+    total = min(cards.count(), max_clicks)
+    for i in range(total):
+        try:
+            it = cards.nth(i)
+            it.scroll_into_view_if_needed(timeout=2000)
+            it.click(timeout=4000, force=True)
+
+            # Espera algo de telefone no painel
+            try:
+                page.wait_for_selector(
+                    "a[href^='tel:'], span:has-text('Telefone'), div:has-text('Telefone')",
+                    timeout=6000
+                )
+            except PWTimeoutError:
+                pass
+
+            # a) link tel:
+            try:
+                link = page.locator("a[href^='tel:']").first
+                if link.count():
+                    raw = (link.get_attribute("href") or "")[4:]
+                    tel = norm_br_e164(raw)
+                    if tel and tel not in seen:
+                        seen.add(tel); found.append(tel)
+            except Exception:
+                pass
+
+            # b) regex no body
+            try:
+                blob = page.inner_text("body")
+                for m in PHONE_RE.findall(blob or ""):
+                    tel = norm_br_e164(m)
+                    if tel and tel not in seen:
+                        seen.add(tel); found.append(tel)
+            except Exception:
+                pass
+
+            # fecha painel
+            try:
+                page.keyboard.press("Escape")
+            except Exception:
+                pass
+
+            # pausa curta estável
+            page.wait_for_timeout(200)
+        except Exception:
+            continue
+
+    return found
+
+# ---- Coleta por cidade / lote ----
+def collect_numbers_for_city(nicho: str, city: str, limit: int, start: int) -> Tuple[List[str], int, int, bool]:
+    """
+    Coleta até 'limit' números numa cidade, a partir de 'start' (0,20,40...).
+    Estratégia direta: abre página, clica nos cards e extrai.
+    """
+    phones: List[str] = []
+    seen: Set[str] = set()
+    searched = 0
+    exhausted_city = False
+
+    q = urllib.parse.quote(f"{nicho} {city}")
+
+    with sync_playwright() as p:
+        browser = p.chromium.launch(
+            headless=True,
+            args=["--no-sandbox", "--disable-dev-shm-usage"]
+        )
+        ctx = browser.new_context(
+            locale="pt-BR",
+            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+        )
+        # bloqueia imagens/fonts para acelerar
+        ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in {"image","font","media"} else r.continue_())
+        ctx.set_default_timeout(10000)
+        ctx.set_default_navigation_timeout(20000)
+
+        page = ctx.new_page()
+        cur = start
+        empty_pages = 0
+        last_len = -1
+
+        while len(phones) < limit:
+            url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={cur}"
+            try:
+                page.goto(url, wait_until="domcontentloaded", timeout=20000)
+            except PWTimeoutError:
+                empty_pages += 1
+                if empty_pages >= 2:
+                    exhausted_city = True
+                    break
+                cur += 20
+                continue
+
+            _accept_consent(page)
+
+            # garante que a lista apareceu
+            try:
+                page.wait_for_selector("div[role='article'], div.VkpGBb, div[role='feed']", timeout=7000)
+            except PWTimeoutError:
+                empty_pages += 1
+                if empty_pages >= 2:
+                    exhausted_city = True
+                    break
+                cur += 20
+                continue
+
+            # clica e extrai
+            got = _extract_by_clicking(page, max_clicks=28)
+            searched += len(got)
+            for t in got:
+                if t not in seen:
+                    seen.add(t); phones.append(t)
+                    if len(phones) >= limit:
+                        break
+
+            # estagnação/termino
+            if last_len == len(phones):
+                empty_pages += 1
+            else:
+                last_len = len(phones)
+                empty_pages = 0
+
+            if empty_pages >= 3:
+                exhausted_city = True
+                break
+
+            cur += 20
+            page.wait_for_timeout(300)  # cadência estável
+
+        ctx.close()
+        browser.close()
+
+    return phones, searched, cur, exhausted_city
+
+def collect_numbers_batch(
+    nicho: str,
+    cities: List[str],
+    limit: int,
+    start_by_city: Dict[str, int] | None = None
+) -> Tuple[List[str], int, Dict[str, int], bool]:
+    """
+    Percorre as cidades na ordem, mantendo offsets, até juntar 'limit'.
+    Retorna (phones, searched_total, next_start_by_city, exhausted_all)
+    """
+    if start_by_city is None:
+        start_by_city = {c: 0 for c in cities}
+
+    result: List[str] = []
+    searched_total = 0
+    exhausted_flags: Dict[str, bool] = {c: False for c in cities}
+
+    for city in cities:
+        if len(result) >= limit:
+            break
+        if exhausted_flags.get(city, False):
+            continue
+
+        start = start_by_city.get(city, 0)
+        remaining = max(0, limit - len(result))
+        phones, searched, next_start, exhausted_city = collect_numbers_for_city(nicho, city, remaining, start)
+
+        for t in phones:
+            if t not in result:
+                result.append(t)
+                if len(result) >= limit:
                     break
 
-                if wa_only:
-                    verdicts = await _uazapi_check_bulk(found)
-                    for p in found:
-                        has = bool(verdicts.get(p, False))
-                        if has and p not in collected:
-                            collected.append(p)
-                            yield "event: item\ndata: " + json.dumps({"phone": p, "has_whatsapp": True}) + "\n\n"
-                            if len(collected) >= want: break
-                    wa_total = len(collected)
-                    non_wa_total += len([p for p in found if not verdicts.get(p, False)])
-                else:
-                    for p in found:
-                        if p not in collected:
-                            collected.append(p)
-                            yield "event: item\ndata: " + json.dumps({"phone": p, "has_whatsapp": False}) + "\n\n"
-                            if len(collected) >= want: break
+        searched_total += searched
+        start_by_city[city] = next_start
+        exhausted_flags[city] = exhausted_city
 
-                if exhausted and len(collected) < want:
-                    break
-
-            yield "event: done\ndata: " + json.dumps({
-                "count": len(collected),
-                "wa_count": wa_total,
-                "non_wa_count": non_wa_total,
-                "searched": len(collected),
-                "exhausted": len(collected) < want
-            }) + "\n\n"
-        except Exception as e:
-            yield "event: error\ndata: " + json.dumps({"error": f"{type(e).__name__}: {str(e)}"}) + "\n\n"
-
-    return StreamingResponse(gen(), media_type="text/event-stream")
+    exhausted_all = all(exhausted_flags.get(c, False) for c in cities)
+    return result, searched_total, start_by_city, exhausted_all
+    
