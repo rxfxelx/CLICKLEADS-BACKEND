@@ -1,19 +1,19 @@
-# server.py
 import os
 import json
-from typing import Dict, Iterable, List, Tuple, Set  # <- Set adicionado
+import asyncio
+import re
+from typing import AsyncGenerator, List
 
-import httpx
-from fastapi import FastAPI, HTTPException, Query
+from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from sse_starlette.sse import EventSourceResponse
+from fastapi.responses import StreamingResponse, JSONResponse
+import httpx
 
-from collector import collect_numbers_batch
+from collector import collect_numbers
 
-UAZAPI_CHECK_URL = (os.getenv("UAZAPI_CHECK_URL") or "").rstrip("/")
-UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN") or ""
+app = FastAPI(title="Lead Extractor API", version="2.0.0")
 
-app = FastAPI(title="Lead Extractor API", version="1.2.0")
+# CORS (Vercel)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https://.*\.vercel\.app$",
@@ -21,186 +21,181 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-def _verify_chunk(cx: httpx.Client, numbers: List[str]) -> Dict[str, bool]:
-    if not (UAZAPI_CHECK_URL and UAZAPI_INSTANCE_TOKEN and numbers):
-        return {n: False for n in numbers}
-    headers_list = [
-        {"token": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
-        {"apikey": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
-        {"Authorization": f"Bearer {UAZAPI_INSTANCE_TOKEN}", "Content-Type": "application/json"},
-    ]
-    body = {"numbers": numbers}
-    for headers in headers_list:
-        try:
-            r = cx.post(UAZAPI_CHECK_URL, json=body, headers=headers, timeout=20)
-            if not (200 <= r.status_code < 300):
-                continue
-            data = r.json()
-            if isinstance(data, list):
-                out = {}
-                for i in data:
-                    q = str(i.get("query") or "").lstrip("+")
-                    iswa = bool(i.get("isInWhatsapp") or i.get("is_whatsapp") or i.get("valid") or i.get("exists"))
-                    if q.startswith("55"):
-                        q = "+" + q
-                    out[q] = iswa
-                return out
-            arr = data.get("data") or data.get("numbers") or []
-            if isinstance(arr, list):
-                out = {}
-                for i in arr:
-                    q = str(i.get("query") or i.get("number") or "").lstrip("+")
-                    iswa = bool(i.get("isInWhatsapp") or i.get("is_whatsapp") or i.get("valid") or i.get("exists"))
-                    if q.startswith("55"):
-                        q = "+" + q
-                    out[q] = iswa
-                return out
-        except Exception:
+UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")
+UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "")
+
+def _digits(n: str) -> str:
+    return re.sub(r"\D", "", n or "")
+
+async def verify_whatsapp(numbers: List[str]) -> set[str]:
+    """
+    Recebe E.164 (+55...), envia dígitos para UAZAPI e devolve set em E.164 dos que têm WA.
+    """
+    if not numbers or not UAZAPI_CHECK_URL or not UAZAPI_INSTANCE_TOKEN:
+        return set()
+
+    # map dígitos -> E.164
+    dmap = {}
+    for n in numbers:
+        d = _digits(n)
+        if not d:
             continue
-    return {n: False for n in numbers}
+        dmap[d] = n if n.startswith("+") else f"+{d}"
 
-def verify_whatsapp(numbers: List[str], chunk_size: int = 80) -> Tuple[List[str], int, int]:
-    if not numbers:
-        return [], 0, 0
-    wa: List[str] = []
-    wa_count = 0
-    non_wa_count = 0
-    with httpx.Client() as cx:
-        for i in range(0, len(numbers), chunk_size):
-            batch = numbers[i : i + chunk_size]
-            result = _verify_chunk(cx, batch)
-            for n in batch:
-                if result.get(n, False):
-                    wa.append(n); wa_count += 1
-                else:
-                    non_wa_count += 1
-    return wa, wa_count, non_wa_count
+    digits = list(dmap.keys())
+    if not digits:
+        return set()
 
-def split_cities(local: str) -> List[str]:
-    return [c.strip() for c in (local or "").split(",") if c.strip()]
+    wa_plus = set()
+    CHUNK = 100
+    headers = {"Content-Type": "application/json", "token": UAZAPI_INSTANCE_TOKEN}
+
+    async with httpx.AsyncClient(timeout=30) as cx:
+        for i in range(0, len(digits), CHUNK):
+            batch = digits[i : i + CHUNK]
+            try:
+                r = await cx.post(UAZAPI_CHECK_URL, json={"numbers": batch}, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+            except Exception:
+                continue
+
+            rows = []
+            if isinstance(data, list):
+                rows = data
+            elif isinstance(data, dict):
+                rows = data.get("data") or data.get("numbers") or []
+                if isinstance(rows, dict):
+                    rows = rows.get("numbers", [])
+
+            for item in rows:
+                q = str(item.get("query") or item.get("number") or item.get("phone") or "")
+                qd = _digits(q)
+                is_wa = bool(
+                    item.get("isInWhatsapp")
+                    or item.get("is_whatsapp")
+                    or item.get("exists")
+                    or item.get("valid")
+                )
+                if is_wa and qd in dmap:
+                    wa_plus.add(dmap[qd])
+
+    return wa_plus
 
 @app.get("/health")
 def health():
-    return {"ok": True}
+    ok = True
+    return {"ok": ok}
 
-@app.get("/leads/stream")
-def leads_stream(
-    nicho: str = Query(...),
-    local: str = Query(...),
-    n: int = Query(50, ge=1, le=500),
-    verify: int = Query(0),
-):
-    cities = split_cities(local)
-    if not cities:
-        raise HTTPException(400, "local inválido")
-
-    def event_generator():
-        yield {"event": "start", "data": "{}"}
-
-        seen: Set[str] = set()
-        start_by_city: Dict[str, int] = {c: 0 for c in cities}
-
-        wa_count = 0
-        non_wa_count = 0
-        emitted = 0
-        exhausted_all = False
-
-        batch_collect = 120
-
-        while emitted < n and not exhausted_all:
-            remaining_collect = max(0, min(batch_collect, 3 * n - emitted))
-            phones, searched, start_by_city, exhausted_all = collect_numbers_batch(
-                nicho, cities, remaining_collect, start_by_city
-            )
-            phones = [p for p in phones if p not in seen]
-            seen.update(phones)
-
-            if not phones:
-                yield {"event": "progress", "data": json.dumps({
-                    "searched": wa_count + non_wa_count,
-                    "wa_count": wa_count,
-                    "non_wa_count": non_wa_count
-                })}
-                if exhausted_all:
-                    break
-                continue
-
-            if verify == 1:
-                wa_list, wa_add, non_add = verify_whatsapp(phones, chunk_size=80)
-                wa_count += wa_add
-                non_wa_count += non_add
-                for num in wa_list:
-                    if emitted >= n: break
-                    yield {"event": "item", "data": json.dumps({"phone": num, "has_whatsapp": True})}
-                    emitted += 1
-            else:
-                for num in phones:
-                    if emitted >= n: break
-                    yield {"event": "item", "data": json.dumps({"phone": num, "has_whatsapp": False})}
-                    emitted += 1
-
-            yield {"event": "progress", "data": json.dumps({
-                "searched": wa_count + non_wa_count if verify == 1 else emitted,
-                "wa_count": wa_count,
-                "non_wa_count": non_wa_count
-            })}
-
-        yield {"event": "done", "data": json.dumps({
-            "count": emitted,
-            "wa_count": wa_count,
-            "non_wa_count": non_wa_count,
-            "searched": wa_count + non_wa_count if verify == 1 else emitted,
-            "exhausted": exhausted_all
-        })}
-
-    return EventSourceResponse(event_generator())
+def _sse_event(event: str, data: dict) -> bytes:
+    return f"event: {event}\n" + f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
 
 @app.get("/leads")
-def leads(
+async def leads(
     nicho: str = Query(...),
     local: str = Query(...),
     n: int = Query(50, ge=1, le=500),
-    verify: int = Query(0),
+    verify: int = Query(0, ge=0, le=1),
 ):
-    cities = split_cities(local)
-    if not cities:
-        raise HTTPException(400, "local inválido")
-
-    items: List[Dict[str, str | bool]] = []
-    wa_count = 0
-    non_wa_count = 0
-    exhausted_all = False
-    start_by_city: Dict[str, int] = {c: 0 for c in cities}
-    seen: Set[str] = set()
-
-    while len(items) < n and not exhausted_all:
-        phones, _, start_by_city, exhausted_all = collect_numbers_batch(
-            nicho, cities, min(120, 3 * n - len(items)), start_by_city
+    try:
+        loop = asyncio.get_running_loop()
+        # coletar um pool maior para compensar filtro do WhatsApp
+        candidates, exhausted_all = await loop.run_in_executor(
+            None, lambda: collect_numbers(nicho, local, n, overscan_mult=8)
         )
-        phones = [p for p in phones if p not in seen]
-        seen.update(phones)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"collector_error: {type(e).__name__}")
 
-        if not phones:
-            break
+    searched = len(candidates)
 
-        if verify == 1:
-            wa_list, wa_add, non_add = verify_whatsapp(phones, chunk_size=80)
-            wa_count += wa_add
-            non_wa_count += non_add
-            for num in wa_list:
-                if len(items) >= n: break
-                items.append({"phone": num, "has_whatsapp": True})
-        else:
-            for num in phones:
-                if len(items) >= n: break
-                items.append({"phone": num, "has_whatsapp": False})
+    if verify == 1:
+        wa_set = await verify_whatsapp(candidates)
+        items_wa = [p for p in candidates if p in wa_set][:n]
+        wa_count = len(items_wa)
+        non_wa_count = searched - wa_count
+        exhausted = exhausted_all and (wa_count < n)
+        return {
+            "count": wa_count,
+            "items": [{"phone": p, "has_whatsapp": True} for p in items_wa],
+            "searched": searched,
+            "wa_count": wa_count,
+            "non_wa_count": non_wa_count,
+            "exhausted": exhausted,
+        }
 
+    # sem verificação
+    items = candidates[:n]
     return {
         "count": len(items),
-        "items": items,
-        "searched": wa_count + non_wa_count if verify == 1 else len(items),
-        "wa_count": wa_count,
-        "non_wa_count": non_wa_count,
-        "exhausted": exhausted_all,
+        "items": [{"phone": p, "has_whatsapp": None} for p in items],
+        "searched": searched,
+        "wa_count": 0,
+        "non_wa_count": searched,
+        "exhausted": exhausted_all and (len(items) < n),
     }
-    
+
+@app.get("/leads/stream")
+async def leads_stream(
+    nicho: str = Query(...),
+    local: str = Query(...),
+    n: int = Query(50, ge=1, le=500),
+    verify: int = Query(0, ge=0, le=1),
+):
+    async def gen() -> AsyncGenerator[bytes, None]:
+        # start
+        yield _sse_event("start", {})
+
+        try:
+            loop = asyncio.get_running_loop()
+            candidates, exhausted_all = await loop.run_in_executor(
+                None, lambda: collect_numbers(nicho, local, n, overscan_mult=8)
+            )
+        except Exception as e:
+            yield _sse_event("error", {"error": f"collector_error: {type(e).__name__}"})
+            return
+
+        searched = len(candidates)
+
+        if verify == 1:
+            wa_set = await verify_whatsapp(candidates)
+            wa_list = [p for p in candidates if p in wa_set][:n]
+            wa_count = len(wa_list)
+            non_wa_count = searched - wa_count
+            # progresso (mostra tudo que varremos e quantos WA de fato)
+            yield _sse_event("progress", {
+                "searched": searched,
+                "wa_count": wa_count,
+                "non_wa_count": non_wa_count
+            })
+            # stream item a item
+            for p in wa_list:
+                yield _sse_event("item", {"phone": p, "has_whatsapp": True})
+
+            exhausted = exhausted_all and (wa_count < n)
+            yield _sse_event("done", {
+                "count": wa_count,
+                "wa_count": wa_count,
+                "non_wa_count": non_wa_count,
+                "searched": searched,
+                "exhausted": exhausted
+            })
+            return
+
+        # sem verificação: stream direto
+        out = candidates[:n]
+        for p in out:
+            yield _sse_event("item", {"phone": p, "has_whatsapp": None})
+        yield _sse_event("progress", {
+            "searched": searched,
+            "wa_count": 0,
+            "non_wa_count": searched
+        })
+        yield _sse_event("done", {
+            "count": len(out),
+            "wa_count": 0,
+            "non_wa_count": searched,
+            "searched": searched,
+            "exhausted": exhausted_all and (len(out) < n)
+        })
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
