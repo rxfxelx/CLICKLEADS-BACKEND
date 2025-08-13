@@ -8,18 +8,21 @@ from anyio import to_thread
 
 from collector import collect_numbers_batch
 
-APP = FastAPI(title="Lead Extractor API", version="2.0.0")
-APP.add_middleware(
+# DEBUG opcional
+DEBUG = os.getenv("DEBUG","0")=="1"
+def _dbg(*a):
+    if DEBUG: print("[server]", *a, flush=True)
+
+# ---------- App ----------
+app = FastAPI(title="Lead Extractor API", version="2.0.0")
+app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r".*",
     allow_methods=["GET","OPTIONS"],
     allow_headers=["*"],
 )
 
-DEBUG = os.getenv("DEBUG","0")=="1"
-def _dbg(*a):
-    if DEBUG: print("[server]", *a, flush=True)
-
+# UAZAPI
 UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL","").rstrip("/")
 UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN","")
 
@@ -52,13 +55,13 @@ async def _uazapi_check_bulk(e164_list: List[str]) -> Dict[str,bool]:
                     if not (200 <= r.status_code < 300):
                         continue
                     data = r.json()
-                    # aceita lista simples [{"query": "...", "isInWhatsapp": true}, ...]
+                    # lista simples
                     if isinstance(data, list):
                         for item in data:
                             q = item.get("query") or item.get("number")
                             out[q] = bool(item.get("isInWhatsapp") or item.get("is_whatsapp") or item.get("valid") or item.get("exists"))
                         ok = True; break
-                    # aceita dict {"data":[...]} ou {"numbers":[...]}
+                    # dict com array
                     arr = data.get("data") or data.get("numbers")
                     if isinstance(arr, list):
                         for item in arr:
@@ -68,7 +71,6 @@ async def _uazapi_check_bulk(e164_list: List[str]) -> Dict[str,bool]:
                 except Exception as e:
                     _dbg("uazapi chunk error:", type(e).__name__)
             if not ok:
-                # se não deu, marca como False pra esse chunk (evita travar)
                 for n in chunk:
                     out[n] = False
     return out
@@ -82,11 +84,11 @@ async def _collect_round(nicho: str, cities: List[str], want: int, starts: Dict[
 
 # ---------- endpoints ----------
 
-@APP.get("/health")
+@app.get("/health")
 def health():
     return {"ok": True}
 
-@APP.get("/leads")
+@app.get("/leads")
 async def leads(nicho: str = Query(...), local: str = Query(...), n: int = Query(50, ge=1, le=500), verify: int = Query(0)):
     if not nicho.strip(): raise HTTPException(400, "nicho vazio")
     if not local.strip(): raise HTTPException(400, "local vazio")
@@ -134,17 +136,16 @@ async def leads(nicho: str = Query(...), local: str = Query(...), n: int = Query
     return {
         "count": len(collected),
         "items": [{"phone": p} for p in collected],
-        "searched": len(collected),  # aproximação amigável
+        "searched": len(collected),
         "wa_count": wa_total,
         "non_wa_count": non_wa_total,
         "exhausted": len(collected) < want
     }
 
-@APP.get("/leads/stream")
+@app.get("/leads/stream")
 async def leads_stream(nicho: str = Query(...), local: str = Query(...), n: int = Query(50, ge=1, le=500), verify: int = Query(0)):
 
     async def gen():
-        # validação
         if not nicho.strip() or not local.strip():
             yield "event: error\ndata: " + json.dumps({"error":"parâmetros inválidos"}) + "\n\n"; return
 
