@@ -2,9 +2,11 @@ import re
 import time
 import urllib.parse
 from typing import List, Set, Tuple
-import phonenumbers
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Error as PWError
 
+import phonenumbers
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+
+# Regex BR flexível
 PHONE_RE = re.compile(r"\(?\d{2}\)?\s?\d{4,5}[-.\s]?\d{4}")
 
 def norm_br_e164(raw: str):
@@ -59,7 +61,7 @@ def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int = 8) -
     Retorna (lista_candidatos, exhausted_all)
     - overscan_mult: quanto acima do alvo tentar coletar (para compensar filtro WA).
     """
-    target_pool = max(alvo * overscan_mult, alvo)  # coletar um pool maior
+    target_pool = max(alvo * overscan_mult, alvo)
     out: List[str] = []
     seen: Set[str] = set()
     exhausted_all = True
@@ -70,7 +72,7 @@ def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int = 8) -
 
     try:
         with sync_playwright() as p:
-            browser = p.chromium.launch(headless=True, args=["--no-sandbox","--disable-dev-shm-usage"])
+            browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
             ctx = browser.new_context(
                 locale="pt-BR",
                 user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -78,7 +80,7 @@ def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int = 8) -
             )
             # bloquear assets pesados
             ctx.route("**/*", lambda r: r.abort()
-                     if r.request.resource_type in {"image","font","media"}
+                     if r.request.resource_type in {"image", "font", "media"}
                      else r.continue_())
             ctx.set_default_timeout(9000)
             ctx.set_default_navigation_timeout(18000)
@@ -108,27 +110,24 @@ def collect_numbers(nicho: str, local: str, alvo: int, overscan_mult: int = 8) -
                             if len(out) >= target_pool:
                                 break
 
-                    # paginar
+                    # paginação e break conditions
                     added = len(seen) - before
                     if added == 0:
                         no_new_in_a_row += 1
                     else:
                         no_new_in_a_row = 0
-
                     if no_new_in_a_row >= 2:
-                        break  # não está vindo mais nada novo
+                        break
 
                     start += 20
                     time.sleep(0.5)
 
-                # se já temos pool suficiente, segue para verificação
                 if len(out) >= target_pool:
                     break
 
             ctx.close()
             browser.close()
     except Exception:
-        # em caso de erro, retorna o que tiver
         return out, False
 
     return out, exhausted_all
