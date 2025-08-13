@@ -1,10 +1,8 @@
-# server.py
 import os
-import re
 import json
 import asyncio
-import math
-from typing import AsyncGenerator, List, Dict, Any
+import re
+from typing import AsyncGenerator, List, Set
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -15,7 +13,7 @@ from collector import collect_numbers
 
 app = FastAPI(title="Lead Extractor API", version="2.0.0")
 
-# CORS – ajuste se precisar liberar outros domínios
+# CORS (Vercel)
 app.add_middleware(
     CORSMiddleware,
     allow_origin_regex=r"^https://.*\.vercel\.app$",
@@ -23,84 +21,36 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")
-UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "")
+# -------- UAZAPI --------
+RAW_UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").strip()
+UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "").strip()
 
-# ------------- Utils -------------
+def _normalized_uazapi_url() -> str:
+    """
+    Garante que a URL termine em /chat/check.
+    Ex.: "https://helsenia.uazapi.com" -> "https://helsenia.uazapi.com/chat/check"
+    """
+    url = RAW_UAZAPI_CHECK_URL.rstrip("/")
+    if not url:
+        return ""
+    if "/chat/check" not in url:
+        url = url + "/chat/check"
+    return url
+
+UAZAPI_CHECK_URL = _normalized_uazapi_url()
+
 def _digits(n: str) -> str:
     return re.sub(r"\D", "", n or "")
 
-def _as_bool(v: Any) -> bool:
-    if isinstance(v, bool):
-        return v
-    if v is None:
-        return False
-    if isinstance(v, (int, float)):
-        return v != 0
-    s = str(v).strip().lower()
-    return s in {"true", "1", "yes", "y", "sim"}
-
-def _sse_event(event: str, data: dict) -> str:
-    return f"event: {event}\n" + f"data: {json.dumps(data, ensure_ascii=False)}\n\n"
-
-# ------------- Verificação WA (robusta) -------------
-WA_KEYS = (
-    "isInWhatsapp",
-    "is_whatsapp",
-    "isWhatsapp",
-    "whatsapp",
-    "inWhatsapp",
-    "exists",
-    "valid",
-    "hasWhatsapp",
-    "has_whatsapp",
-)
-
-def _pick_rows(payload: Any) -> List[dict]:
-    if isinstance(payload, list):
-        return payload
-    if isinstance(payload, dict):
-        for k in ("data", "result", "results", "numbers"):
-            v = payload.get(k)
-            if isinstance(v, list):
-                return v
-            if isinstance(v, dict):
-                vv = v.get("numbers")
-                if isinstance(vv, list):
-                    return vv
-    return []
-
-def _pick_query(item: dict) -> str:
-    for k in ("query", "number", "phone", "jid", "input"):
-        v = item.get(k)
-        if v:
-            return str(v)
-    return ""
-
-async def _post_check(
-    client: httpx.AsyncClient,
-    url: str,
-    numbers: List[str],
-    headers: Dict[str, str],
-    token_in_body: bool,
-    token_value: str,
-) -> List[dict]:
-    body = {"numbers": numbers}
-    if token_in_body:
-        body["token"] = token_value
-    r = await client.post(url, json=body, headers=headers)
-    r.raise_for_status()
-    return _pick_rows(r.json())
-
-async def verify_whatsapp(numbers: List[str]) -> set[str]:
+async def verify_whatsapp(numbers: List[str]) -> Set[str]:
     """
-    Tenta diferentes formas de autenticação e formatos dos números.
-    Retorna conjunto em E.164 dos que têm WhatsApp.
+    Recebe números E.164 (+55...), envia DIGITOS para a UAZAPI e devolve
+    um set em E.164 dos que têm WhatsApp.
     """
     if not numbers or not UAZAPI_CHECK_URL or not UAZAPI_INSTANCE_TOKEN:
         return set()
 
-    # mapa dígitos -> E.164
+    # map: dígitos -> E.164
     dmap = {}
     for n in numbers:
         d = _digits(n)
@@ -111,73 +61,57 @@ async def verify_whatsapp(numbers: List[str]) -> set[str]:
     if not digits:
         return set()
 
-    # Estratégias: headers e inclusão do token no body
-    header_variants = [
-        {"token": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
-        {"Authorization": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
-        {"Authorization": f"Bearer {UAZAPI_INSTANCE_TOKEN}", "Content-Type": "application/json"},
-        {"x-api-key": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"},
-    ]
-    token_in_body_variants = [False, True]
+    wa_plus: Set[str] = set()
+    CHUNK = 100
+    headers = {"Content-Type": "application/json", "token": UAZAPI_INSTANCE_TOKEN}
 
-    # formatos de números: só dígitos e com "+"
-    format_variants = [
-        digits,
-        [f"+{d}" for d in digits],
-    ]
+    async with httpx.AsyncClient(timeout=httpx.Timeout(30)) as cx:
+        for i in range(0, len(digits), CHUNK):
+            batch = digits[i : i + CHUNK]
+            try:
+                r = await cx.post(UAZAPI_CHECK_URL, json={"numbers": batch}, headers=headers)
+                if r.status_code != 200:
+                    continue
+                data = r.json()
+            except Exception:
+                continue
 
-    CHUNK = 50
-    MAX_RETRIES = 2
-    wa_plus = set()
+            # Tenta entender diferentes formatos de resposta
+            rows = []
+            if isinstance(data, list):
+                rows = data
+            elif isinstance(data, dict):
+                # alguns retornam {data:[...]} ou {numbers:[...]} etc
+                rows = data.get("data") or data.get("numbers") or data.get("result") or []
+                if isinstance(rows, dict):
+                    rows = rows.get("numbers", [])
 
-    async with httpx.AsyncClient(timeout=30) as cx:
-        for fmt_numbers in format_variants:
-            if wa_plus:
-                break
-            for headers in header_variants:
-                if wa_plus:
-                    break
-                for tib in token_in_body_variants:
-                    positives = set()
-                    try:
-                        for i in range(0, len(fmt_numbers), CHUNK):
-                            batch = fmt_numbers[i : i + CHUNK]
-                            # retry simples
-                            tries = 0
-                            while True:
-                                try:
-                                    rows = await _post_check(cx, UAZAPI_CHECK_URL, batch, headers, tib, UAZAPI_INSTANCE_TOKEN)
-                                    break
-                                except Exception:
-                                    tries += 1
-                                    if tries > MAX_RETRIES:
-                                        rows = []
-                                        break
-                                    await asyncio.sleep(0.8 * tries)
-
-                            for it in rows:
-                                q = _digits(_pick_query(it))
-                                if not q:
-                                    continue
-                                is_wa = any(_as_bool(it.get(k)) for k in WA_KEYS)
-                                if is_wa and q in dmap:
-                                    positives.add(dmap[q])
-
-                            # respiro leve para evitar throttling
-                            await asyncio.sleep(0.1)
-                    except Exception:
-                        positives = set()
-
-                    if positives:
-                        wa_plus |= positives
-                        break  # já validou com essa estratégia
+            for item in rows or []:
+                # campo do número consultado
+                q = str(item.get("query") or item.get("number") or item.get("phone") or item.get("input") or "")
+                qd = _digits(q)
+                # campo boolean pode variar
+                is_wa = bool(
+                    item.get("isInWhatsapp")
+                    or item.get("isInWhatsApp")
+                    or item.get("is_whatsapp")
+                    or item.get("whatsapp")
+                    or item.get("exists")
+                    or item.get("valid")
+                )
+                if is_wa and qd in dmap:
+                    wa_plus.add(dmap[qd])
 
     return wa_plus
 
-# ------------- Rotas -------------
+# -------- util SSE --------
+def _sse_event(event: str, data: dict) -> bytes:
+    return f"event: {event}\n" + f"data: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+
+# -------- endpoints --------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "uazapi_url": UAZAPI_CHECK_URL != "", "has_token": bool(UAZAPI_INSTANCE_TOKEN)}
 
 @app.get("/leads")
 async def leads(
@@ -228,7 +162,7 @@ async def leads_stream(
     n: int = Query(50, ge=1, le=500),
     verify: int = Query(0, ge=0, le=1),
 ):
-    async def gen() -> AsyncGenerator[str, None]:
+    async def gen() -> AsyncGenerator[bytes, None]:
         yield _sse_event("start", {})
 
         try:
@@ -253,6 +187,7 @@ async def leads_stream(
                 "wa_count": wa_count,
                 "non_wa_count": non_wa_count
             })
+
             for p in wa_list:
                 yield _sse_event("item", {"phone": p, "has_whatsapp": True})
 
@@ -266,6 +201,7 @@ async def leads_stream(
             })
             return
 
+        # sem verificação
         out = candidates[:n]
         for p in out:
             yield _sse_event("item", {"phone": p, "has_whatsapp": None})
