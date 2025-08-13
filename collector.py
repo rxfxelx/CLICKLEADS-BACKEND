@@ -1,15 +1,22 @@
+# collector.py
 import re
 import time
 import urllib.parse
 from typing import Dict, List, Set, Tuple
 
 import phonenumbers
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
+from playwright.sync_api import (
+    sync_playwright,
+    TimeoutError as PWTimeoutError,
+)
 
-# ---- Regex / normalização ----
+# Regex genérica para capturar possíveis telefones e deixar a
+# validação/normalização para o phonenumbers (Brasil)
 PHONE_RE = re.compile(r"\+?(\d[\d .()\-]{8,}\d)")
 
+
 def norm_br_e164(raw: str) -> str | None:
+    """Normaliza qualquer telefone detectado para +E164 Brasil (+55...)."""
     d = re.sub(r"\D", "", raw or "")
     if not d:
         return None
@@ -23,8 +30,9 @@ def norm_br_e164(raw: str) -> str | None:
         pass
     return None
 
-# ---- Consent do Google ----
-def _accept_consent(page):
+
+def _accept_consent(page) -> None:
+    """Fecha banners de consentimento do Google quando aparecerem."""
     sels = [
         "#L2AGLb",
         "button:has-text('Aceitar tudo')",
@@ -42,73 +50,58 @@ def _accept_consent(page):
         except Exception:
             pass
 
-# ---- Extração clicando nos cards (mais confiável para aparecer o telefone) ----
-def _extract_by_clicking(page, max_clicks: int = 25) -> List[str]:
-    found: List[str] = []
+
+def _numbers_from_local_page(page) -> List[str]:
+    """
+    Extrai números da página local do Google:
+      1) <a href="tel:...">
+      2) Regex no texto do body (cartões + painel lateral)
+    """
+    out: List[str] = []
     seen: Set[str] = set()
 
-    cards = page.get_by_role("article")
-    if cards.count() == 0:
-        cards = page.locator("div.VkpGBb, div[role='article']")
+    # 1) Ancoras tel:
+    try:
+        for a in page.locator('a[href^="tel:"]').all():
+            raw = (a.get_attribute("href") or "").replace("tel:", "")
+            tel = norm_br_e164(raw)
+            if tel and tel not in seen:
+                seen.add(tel)
+                out.append(tel)
+    except Exception:
+        pass
 
-    total = min(cards.count(), max_clicks)
-    for i in range(total):
-        try:
-            it = cards.nth(i)
-            it.scroll_into_view_if_needed(timeout=2000)
-            it.click(timeout=4000, force=True)
+    # 2) Regex no body
+    try:
+        blob = page.inner_text("body")
+        for m in PHONE_RE.findall(blob or ""):
+            tel = norm_br_e164(m)
+            if tel and tel not in seen:
+                seen.add(tel)
+                out.append(tel)
+    except Exception:
+        pass
 
-            # Espera algo de telefone no painel
-            try:
-                page.wait_for_selector(
-                    "a[href^='tel:'], span:has-text('Telefone'), div:has-text('Telefone')",
-                    timeout=6000
-                )
-            except PWTimeoutError:
-                pass
+    return out
 
-            # a) link tel:
-            try:
-                link = page.locator("a[href^='tel:']").first
-                if link.count():
-                    raw = (link.get_attribute("href") or "")[4:]
-                    tel = norm_br_e164(raw)
-                    if tel and tel not in seen:
-                        seen.add(tel); found.append(tel)
-            except Exception:
-                pass
 
-            # b) regex no body
-            try:
-                blob = page.inner_text("body")
-                for m in PHONE_RE.findall(blob or ""):
-                    tel = norm_br_e164(m)
-                    if tel and tel not in seen:
-                        seen.add(tel); found.append(tel)
-            except Exception:
-                pass
-
-            # fecha painel
-            try:
-                page.keyboard.press("Escape")
-            except Exception:
-                pass
-
-            # pausa curta estável
-            page.wait_for_timeout(200)
-        except Exception:
-            continue
-
-    return found
-
-# ---- Coleta por cidade / lote ----
-def collect_numbers_for_city(nicho: str, city: str, limit: int, start: int) -> Tuple[List[str], int, int, bool]:
+def collect_numbers_for_city(
+    nicho: str,
+    city: str,
+    limit: int,
+    start: int,
+) -> Tuple[List[str], int, int, bool]:
     """
-    Coleta até 'limit' números numa cidade, a partir de 'start' (0,20,40...).
-    Estratégia direta: abre página, clica nos cards e extrai.
+    Coleta até 'limit' números para UMA cidade, iniciando na paginação 'start'
+    (0, 20, 40...). Retorna:
+      (phones, searched, next_start, exhausted_city)
+
+    - phones: números únicos coletados (E.164)
+    - searched: quantidade de ocorrências lidas (aprox.)
+    - next_start: offset para próxima iteração nessa cidade
+    - exhausted_city: True se não há mais o que paginar/obter
     """
     phones: List[str] = []
-    seen: Set[str] = set()
     searched = 0
     exhausted_city = False
 
@@ -117,112 +110,25 @@ def collect_numbers_for_city(nicho: str, city: str, limit: int, start: int) -> T
     with sync_playwright() as p:
         browser = p.chromium.launch(
             headless=True,
-            args=["--no-sandbox", "--disable-dev-shm-usage"]
+            args=[
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
         )
         ctx = browser.new_context(
             locale="pt-BR",
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"),
+            user_agent=(
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+            ),
+            viewport={"width": 1280, "height": 800},
         )
-        # bloqueia imagens/fonts para acelerar
-        ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in {"image","font","media"} else r.continue_())
-        ctx.set_default_timeout(10000)
-        ctx.set_default_navigation_timeout(20000)
-
-        page = ctx.new_page()
-        cur = start
-        empty_pages = 0
-        last_len = -1
-
-        while len(phones) < limit:
-            url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={cur}"
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=20000)
-            except PWTimeoutError:
-                empty_pages += 1
-                if empty_pages >= 2:
-                    exhausted_city = True
-                    break
-                cur += 20
-                continue
-
-            _accept_consent(page)
-
-            # garante que a lista apareceu
-            try:
-                page.wait_for_selector("div[role='article'], div.VkpGBb, div[role='feed']", timeout=7000)
-            except PWTimeoutError:
-                empty_pages += 1
-                if empty_pages >= 2:
-                    exhausted_city = True
-                    break
-                cur += 20
-                continue
-
-            # clica e extrai
-            got = _extract_by_clicking(page, max_clicks=28)
-            searched += len(got)
-            for t in got:
-                if t not in seen:
-                    seen.add(t); phones.append(t)
-                    if len(phones) >= limit:
-                        break
-
-            # estagnação/termino
-            if last_len == len(phones):
-                empty_pages += 1
-            else:
-                last_len = len(phones)
-                empty_pages = 0
-
-            if empty_pages >= 3:
-                exhausted_city = True
-                break
-
-            cur += 20
-            page.wait_for_timeout(300)  # cadência estável
-
-        ctx.close()
-        browser.close()
-
-    return phones, searched, cur, exhausted_city
-
-def collect_numbers_batch(
-    nicho: str,
-    cities: List[str],
-    limit: int,
-    start_by_city: Dict[str, int] | None = None
-) -> Tuple[List[str], int, Dict[str, int], bool]:
-    """
-    Percorre as cidades na ordem, mantendo offsets, até juntar 'limit'.
-    Retorna (phones, searched_total, next_start_by_city, exhausted_all)
-    """
-    if start_by_city is None:
-        start_by_city = {c: 0 for c in cities}
-
-    result: List[str] = []
-    searched_total = 0
-    exhausted_flags: Dict[str, bool] = {c: False for c in cities}
-
-    for city in cities:
-        if len(result) >= limit:
-            break
-        if exhausted_flags.get(city, False):
-            continue
-
-        start = start_by_city.get(city, 0)
-        remaining = max(0, limit - len(result))
-        phones, searched, next_start, exhausted_city = collect_numbers_for_city(nicho, city, remaining, start)
-
-        for t in phones:
-            if t not in result:
-                result.append(t)
-                if len(result) >= limit:
-                    break
-
-        searched_total += searched
-        start_by_city[city] = next_start
-        exhausted_flags[city] = exhausted_city
-
-    exhausted_all = all(exhausted_flags.get(c, False) for c in cities)
-    return result, searched_total, start_by_city, exhausted_all
+        # Bloqueia recursos pesados para acelerar e reduzir chance de bloqueio
+        ctx.route(
+            "**/*",
+            lambda r: r.abort()
+            if r.request.resource_type in {"image", "font", "media"}
+            else r.continue_(),
+        )
+        ctx
+        
