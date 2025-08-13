@@ -1,265 +1,332 @@
 import os
+import re
 import json
+import random
 import asyncio
-from typing import Dict, List, Set, Tuple
+from typing import AsyncGenerator, List, Set, Dict
+
+import httpx
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from starlette.responses import StreamingResponse, JSONResponse
-import httpx
+from fastapi.responses import StreamingResponse
 
-from collector import collect_numbers_batch
+from collector import iter_numbers  # gerador incremental por cidade
 
-# ========= Config UAZAPI =========
-UAZAPI_SUBDOMAIN = os.getenv("UAZAPI_SUBDOMAIN", "").strip()
-UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "").strip()
-UAZAPI_URL = f"https://{UAZAPI_SUBDOMAIN}.uazapi.com/chat/check" if UAZAPI_SUBDOMAIN else ""
+app = FastAPI(title="Smart Leads API", version="3.1.0")
 
-# ========= FastAPI =========
-app = FastAPI(title="Smart Leads API", version="2.0.0")
-
-# CORS: libera produção e previews do Vercel
+# ---------------- CORS ----------------
 app.add_middleware(
     CORSMiddleware,
-    allow_origin_regex=r"^https://.*\.vercel\.app$",
-    allow_methods=["GET", "OPTIONS"],
+    allow_origin_regex=r"^https://.*\.vercel\.app$",   # ajuste para seu domínio se quiser
+    allow_methods=["GET", "POST", "OPTIONS"],
     allow_headers=["*"],
+    allow_credentials=False,
 )
 
-# ========= Helpers =========
-def split_cities(local: str) -> List[str]:
-    # ex: "Belo Horizonte, Contagem, Betim"
-    cities = [c.strip() for c in local.split(",") if c.strip()]
-    return cities or [local.strip()]
+# ---------------- UAZAPI ENV ----------------
+UAZAPI_CHECK_URL = os.getenv("UAZAPI_CHECK_URL", "").rstrip("/")
+UAZAPI_INSTANCE_TOKEN = os.getenv("UAZAPI_INSTANCE_TOKEN", "")
 
-async def verify_whatsapp_batch(numbers: List[str]) -> Set[str]:
-    """
-    Verifica em lote na UAZAPI (única chamada). Retorna um set com os números que têm WhatsApp.
-    Se não houver configuração, retorna set vazio e o caller decide o que fazer.
-    """
-    if not (UAZAPI_URL and UAZAPI_INSTANCE_TOKEN and numbers):
-        return set()
+UAZAPI_BATCH_SIZE = int(os.getenv("UAZAPI_BATCH_SIZE", "50"))       # números por request
+UAZAPI_MAX_CONCURRENCY = int(os.getenv("UAZAPI_MAX_CONCURRENCY", "3"))
+UAZAPI_TIMEOUT = float(os.getenv("UAZAPI_TIMEOUT", "12"))
+UAZAPI_RETRIES = int(os.getenv("UAZAPI_RETRIES", "2"))
+UAZAPI_THROTTLE_MS = int(os.getenv("UAZAPI_THROTTLE_MS", "120"))    # pausa entre requests (ms)
 
-    # UAZAPI aceita {"numbers": [..]} e retorna uma lista de objetos com "query", "isInWhatsapp".
-    payload = {"numbers": numbers}
-    headers = {"token": UAZAPI_INSTANCE_TOKEN, "Content-Type": "application/json"}
+# ---------------- COLETA ENV ----------------
+COLLECT_STEP = int(os.getenv("COLLECT_STEP", "40"))                  # ritmo do coletor
+OVERSCAN_MULT = int(os.getenv("OVERSCAN_MULT", "8"))                 # margem p/ compensar não-WA
 
-    async with httpx.AsyncClient(timeout=30) as cx:
-        try:
-            r = await cx.post(UAZAPI_URL, headers=headers, json=payload)
-            if r.status_code // 100 != 2:
-                return set()
-            data = r.json()
-            out = set()
-            if isinstance(data, list):
-                for item in data:
-                    try:
-                        if item.get("isInWhatsapp") is True:
-                            q = str(item.get("query") or "").strip()
-                            if q:
-                                out.add(q)
-                    except Exception:
-                        continue
+DEBUG = os.getenv("DEBUG", "0") == "1"
+
+# --------------- UTILS ---------------
+def _digits(n: str) -> str:
+    return re.sub(r"\D", "", n or "")
+
+def _sse(event: str, data: dict) -> bytes:
+    return (f"event: {event}\n" + f"data: {json.dumps(data, ensure_ascii=False)}\n\n").encode()
+
+def _cities(local: str) -> List[str]:
+    cs = [c.strip() for c in (local or "").split(",")]
+    return [c for c in cs if c]
+
+def _uaz_ready() -> bool:
+    return bool(UAZAPI_CHECK_URL and UAZAPI_INSTANCE_TOKEN)
+
+# --------------- VERIFICAÇÃO UAZAPI ---------------
+def _b(v):
+    if isinstance(v, bool): return v
+    if v is None: return False
+    return str(v).lower() in ("true","1","yes","y")
+
+def _normalize_flags(payload) -> Dict[str, bool]:
+    """Aceita formatos comuns da UAZAPI e devolve { query/number/phone: bool }."""
+    out: Dict[str, bool] = {}
+    if isinstance(payload, list):
+        for i in payload:
+            q = i.get("query") or i.get("number") or i.get("phone")
+            if q:
+                out[q] = _b(i.get("isInWhatsapp") or i.get("exists") or i.get("valid") or i.get("is_whatsapp"))
+        return out
+    if isinstance(payload, dict):
+        data = payload.get("data") or payload.get("numbers")
+        if isinstance(data, list):
+            for i in data:
+                q = i.get("query") or i.get("number") or i.get("phone")
+                if q:
+                    out[q] = _b(i.get("isInWhatsapp") or i.get("exists") or i.get("valid") or i.get("is_whatsapp"))
             return out
-        except Exception:
-            return set()
+        if isinstance(data, dict):
+            arr = data.get("numbers") or []
+            if isinstance(arr, list):
+                for i in arr:
+                    q = i.get("query") or i.get("number") or i.get("phone")
+                    if q:
+                        out[q] = _b(i.get("isInWhatsapp") or i.get("exists") or i.get("valid") or i.get("is_whatsapp"))
+                return out
+    return out
 
-def json_event(event: str, data: dict) -> bytes:
-    return f"event: {event}\ndata: {json.dumps(data, ensure_ascii=False)}\n\n".encode("utf-8")
+async def _verify_chunk(client: httpx.AsyncClient, chunk_digits: List[str]) -> Dict[str, bool]:
+    headers = {"Content-Type": "application/json", "token": UAZAPI_INSTANCE_TOKEN}
+    body = {"numbers": chunk_digits}
+    last_err = None
+    for attempt in range(UAZAPI_RETRIES + 1):
+        try:
+            r = await client.post(UAZAPI_CHECK_URL, json=body, headers=headers, timeout=UAZAPI_TIMEOUT)
+            if r.status_code >= 500 or r.status_code == 429:
+                raise httpx.HTTPStatusError("uazapi busy", request=r.request, response=r)
+            r.raise_for_status()
+            data = r.json()
+            flags = _normalize_flags(data)
+            if DEBUG:
+                print(f"[UAZAPI] batch={len(chunk_digits)} ok={sum(1 for v in flags.values() if _b(v))} try={attempt}")
+            if not flags and attempt < UAZAPI_RETRIES:
+                await asyncio.sleep(0.6 * (attempt + 1) + random.random() * 0.4)
+                continue
+            return flags
+        except Exception as e:
+            last_err = e
+            if DEBUG:
+                print(f"[UAZAPI] error try={attempt}: {e}")
+            if attempt < UAZAPI_RETRIES:
+                await asyncio.sleep(0.6 * (attempt + 1) + random.random() * 0.4)
+            else:
+                return {d: False for d in chunk_digits}
+    if DEBUG and last_err:
+        print(f"[UAZAPI] final error: {last_err}")
+    return {d: False for d in chunk_digits}
 
-# ========= Endpoints =========
+async def verify_numbers_uazapi(e164_list: List[str]) -> Dict[str, bool]:
+    """Recebe E.164 (+55...), envia DÍGITOS para UAZAPI em lotes concorrentes e retorna {E.164: True/False}."""
+    if not e164_list or not _uaz_ready():
+        return {n: False for n in e164_list}
+
+    d2e: Dict[str, str] = {}
+    digits_list: List[str] = []
+    for n in e164_list:
+        d = _digits(n)
+        if d:
+            d2e[d] = n if n.startswith("+") else f"+{d}"
+            digits_list.append(d)
+    if not digits_list:
+        return {n: False for n in e164_list}
+
+    limits = httpx.Limits(max_keepalive_connections=UAZAPI_MAX_CONCURRENCY,
+                          max_connections=UAZAPI_MAX_CONCURRENCY)
+    sem = asyncio.Semaphore(UAZAPI_MAX_CONCURRENCY)
+    out: Dict[str, bool] = {}
+
+    async with httpx.AsyncClient(limits=limits, timeout=UAZAPI_TIMEOUT) as client:
+        async def worker(chunk: List[str]):
+            async with sem:
+                flags = await _verify_chunk(client, chunk)
+                for k, v in flags.items():
+                    kd = _digits(k)
+                    if kd in d2e:
+                        out[d2e[kd]] = bool(_b(v))
+                if UAZAPI_THROTTLE_MS > 0:
+                    await asyncio.sleep(UAZAPI_THROTTLE_MS / 1000.0)
+
+        tasks = []
+        for i in range(0, len(digits_list), UAZAPI_BATCH_SIZE):
+            tasks.append(asyncio.create_task(worker(digits_list[i:i+UAZAPI_BATCH_SIZE])))
+        await asyncio.gather(*tasks)
+
+    return {n: out.get(n, False) for n in e164_list}
+
+# --------------- HEALTH ---------------
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {
+        "ok": True,
+        "uaz_ready": _uaz_ready(),
+        "batch": UAZAPI_BATCH_SIZE,
+        "concurrency": UAZAPI_MAX_CONCURRENCY,
+    }
 
+# --------------- /leads (JSON) ---------------
 @app.get("/leads")
 async def leads(
-    nicho: str = Query(..., min_length=1),
-    local: str = Query(..., min_length=1),
+    nicho: str = Query(...),
+    local: str = Query(...),
     n: int = Query(50, ge=1, le=500),
     verify: int = Query(0, ge=0, le=1),
 ):
-    """
-    Coleta números e (opcional) verifica WhatsApp em lote.
-    Se verify=1, tentamos continuar coletando até atingir n números com WhatsApp
-    ou esgotar as páginas.
-    """
-    cities = split_cities(local)
-    # Estado de paginação por cidade (start offset)
-    start_by_city: Dict[str, int] = {c: 0 for c in cities}
+    locais = _cities(local)
+    if not locais:
+        raise HTTPException(status_code=400, detail="local inválido")
 
-    collected_global: List[str] = []
-    wa_set: Set[str] = set()
-    wa_count = 0
-    non_wa_count = 0
-    exhausted_all = False
+    seen: Set[str] = set()
+    wa_list: List[str] = []
+    searched = 0
 
-    # Quantos por rodada de coleta (buffer maior ajuda quando vamos filtrar por WA)
-    batch_target = max(60, min(200, n * 2))
+    try:
+        for city in locais:
+            max_city_candidates = n * OVERSCAN_MULT
+            buffer: List[str] = []
 
-    # Loop até atingir n (se verify=1) ou até reunir n (verify=0), ou esgotar
-    while True:
-        # coleta síncrona no thread pool (para não misturar Playwright sync com loop async)
-        numbers, searched_round, start_by_city, exhausted_round = await asyncio.to_thread(
-            collect_numbers_batch,
-            nicho,
-            cities,
-            batch_target,
-            start_by_city
-        )
+            for tel in iter_numbers(nicho, city, max_total=max_city_candidates, step=COLLECT_STEP):
+                if tel in seen:
+                    continue
+                seen.add(tel)
+                buffer.append(tel)
 
-        # Adiciona coletados deduplicando na ordem
-        for tel in numbers:
-            if tel not in collected_global:
-                collected_global.append(tel)
+                if len(buffer) >= UAZAPI_BATCH_SIZE:
+                    searched += len(buffer)
+                    if verify == 1 and _uaz_ready():
+                        wa_map = await verify_numbers_uazapi(buffer)
+                        wa_list.extend([p for p, ok in wa_map.items() if ok])
+                        if len(wa_list) >= n:
+                            break
+                    buffer.clear()
 
-        if verify == 1:
-            # verifica tudo que ainda não verificamos
-            to_check = [t for t in collected_global if t not in wa_set]
-            chk = await verify_whatsapp_batch(to_check)
-            wa_set.update(chk)
-            wa_count = len(wa_set)
-            non_wa_count = max(0, len(collected_global) - wa_count)
+            if buffer and (verify == 1 and _uaz_ready()):
+                searched += len(buffer)
+                wa_map = await verify_numbers_uazapi(buffer)
+                wa_list.extend([p for p, ok in wa_map.items() if ok])
+                buffer.clear()
 
-            # se já atingimos n WhatsApp, paramos
-            if wa_count >= n:
-                exhausted_all = False
+            if verify == 1 and len(wa_list) >= n:
                 break
-        else:
-            # sem verificar: paramos quando atingirmos n números brutos
-            if len(collected_global) >= n:
-                exhausted_all = False
-                break
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"collector_error: {type(e).__name__}")
 
-        # se rodada esgotou geral e não atingimos objetivo, finaliza
-        if exhausted_round:
-            exhausted_all = True
-            break
-
-        # aumenta um pouco o alvo da próxima rodada (progressivo)
-        batch_target = min(500, batch_target + max(20, n // 2))
-
-    # Monta resposta
     if verify == 1:
-        # entrega no máximo n com WhatsApp
-        wa_list = [p for p in collected_global if p in wa_set]
-        wa_list = wa_list[:n]
-        items = [{"phone": p, "has_whatsapp": True} for p in wa_list]
-        return JSONResponse({
+        items = [{"phone": p, "has_whatsapp": True} for p in wa_list[:n]]
+        return {
             "count": len(items),
             "items": items,
-            "searched": len(collected_global),
+            "searched": searched,
             "wa_count": len(wa_list),
-            "non_wa_count": max(0, len(collected_global) - len(wa_list)),
-            "exhausted": exhausted_all
-        })
-    else:
-        items = [{"phone": p, "has_whatsapp": None} for p in collected_global[:n]]
-        return JSONResponse({
-            "count": len(items),
-            "items": items,
-            "searched": len(collected_global),
-            "wa_count": 0,
-            "non_wa_count": 0,
-            "exhausted": exhausted_all
-        })
+            "non_wa_count": searched - len(wa_list),
+            "exhausted": len(items) < n,
+        }
 
+    # verify=0
+    first_n = list(seen)[:n]
+    items = [{"phone": p, "has_whatsapp": None} for p in first_n]
+    return {
+        "count": len(items),
+        "items": items,
+        "searched": len(seen),
+        "wa_count": 0,
+        "non_wa_count": 0,
+        "exhausted": len(items) < n,
+    }
+
+# --------------- /leads/stream (SSE) ---------------
 @app.get("/leads/stream")
 async def leads_stream(
-    nicho: str = Query(..., min_length=1),
-    local: str = Query(..., min_length=1),
+    nicho: str = Query(...),
+    local: str = Query(...),
     n: int = Query(50, ge=1, le=500),
     verify: int = Query(0, ge=0, le=1),
 ):
-    """
-    Versão SSE: envia start, progress, item (após verificação), done.
-    Verificação é feita **após** cada rodada de coleta.
-    """
+    locais = _cities(local)
+    if not locais:
+        return StreamingResponse(iter([_sse("error", {"error":"local inválido"})]), media_type="text/event-stream")
 
-    async def gen():
+    async def gen() -> AsyncGenerator[bytes, None]:
+        seen: Set[str] = set()
+        wa_count = 0
+        non_wa_count = 0
+        searched = 0
+
+        yield _sse("start", {})
+
         try:
-            yield json_event("start", {})
-            cities = split_cities(local)
-            start_by_city: Dict[str, int] = {c: 0 for c in cities}
+            for city in locais:
+                max_city_candidates = n * OVERSCAN_MULT
+                buffer: List[str] = []
 
-            collected_global: List[str] = []
-            wa_set: Set[str] = set()
-            wa_count = 0
-            non_wa_count = 0
-            exhausted_all = False
+                for tel in iter_numbers(nicho, city, max_total=max_city_candidates, step=COLLECT_STEP):
+                    if tel in seen:
+                        continue
+                    seen.add(tel)
+                    buffer.append(tel)
 
-            batch_target = max(60, min(200, n * 2))
+                    if len(buffer) >= UAZAPI_BATCH_SIZE:
+                        searched += len(buffer)
+                        if verify == 1 and _uaz_ready():
+                            wa_map = await verify_numbers_uazapi(buffer)
+                            wa_batch = [p for p, ok in wa_map.items() if ok]
+                            non_wa_count += len(buffer) - len(wa_batch)
 
-            while True:
-                numbers, searched_round, start_by_city, exhausted_round = await asyncio.to_thread(
-                    collect_numbers_batch,
-                    nicho, cities, batch_target, start_by_city
-                )
+                            for p in wa_batch:
+                                wa_count += 1
+                                if wa_count <= n:
+                                    yield _sse("item", {"phone": p, "has_whatsapp": True})
 
-                # junta/conta
-                new_count = 0
-                for tel in numbers:
-                    if tel not in collected_global:
-                        collected_global.append(tel)
-                        new_count += 1
+                            yield _sse("progress", {
+                                "searched": searched,
+                                "wa_count": wa_count,
+                                "non_wa_count": non_wa_count
+                            })
 
-                # progresso bruto (antes de verificar)
-                yield json_event("progress", {
-                    "searched": len(collected_global),
-                    "wa_count": wa_count,
-                    "non_wa_count": non_wa_count
-                })
+                            if wa_count >= n:
+                                break
+                        else:
+                            # sem verificação: stream direto (até n)
+                            for p in buffer[:max(0, n - wa_count)]:
+                                yield _sse("item", {"phone": p, "has_whatsapp": None})
+                            yield _sse("progress", {"searched": searched, "wa_count": 0, "non_wa_count": 0})
+                        buffer.clear()
 
-                if verify == 1:
-                    to_check = [t for t in collected_global if t not in wa_set]
-                    chk = await verify_whatsapp_batch(to_check)
-                    wa_set.update(chk)
-                    wa_count = len(wa_set)
-                    non_wa_count = max(0, len(collected_global) - wa_count)
+                # resto da cidade
+                if buffer:
+                    searched += len(buffer)
+                    if verify == 1 and _uaz_ready():
+                        wa_map = await verify_numbers_uazapi(buffer)
+                        wa_batch = [p for p, ok in wa_map.items() if ok]
+                        non_wa_count += len(buffer) - len(wa_batch)
+                        for p in wa_batch:
+                            wa_count += 1
+                            if wa_count <= n:
+                                yield _sse("item", {"phone": p, "has_whatsapp": True})
+                        yield _sse("progress", {
+                            "searched": searched,
+                            "wa_count": wa_count,
+                            "non_wa_count": non_wa_count
+                        })
+                    else:
+                        for p in buffer[:max(0, n - wa_count)]:
+                            yield _sse("item", {"phone": p, "has_whatsapp": None})
+                        yield _sse("progress", {"searched": searched, "wa_count": 0, "non_wa_count": 0})
+                    buffer.clear()
 
-                    # envia os itens (apenas WA)
-                    for p in collected_global:
-                        if p in wa_set:
-                            yield json_event("item", {"phone": p, "has_whatsapp": True})
-
-                    if wa_count >= n:
-                        exhausted_all = False
-                        break
-                else:
-                    # envia os itens brutos
-                    for p in collected_global:
-                        yield json_event("item", {"phone": p, "has_whatsapp": None})
-
-                    if len(collected_global) >= n:
-                        exhausted_all = False
-                        break
-
-                if exhausted_round:
-                    exhausted_all = True
+                if verify == 1 and wa_count >= n:
                     break
 
-                batch_target = min(500, batch_target + max(20, n // 2))
+            exhausted = (verify == 1 and wa_count < n) or (verify == 0 and len(seen) < n)
 
-            # finalize
-            if verify == 1:
-                wa_list = [p for p in collected_global if p in wa_set][:n]
-                yield json_event("done", {
-                    "count": len(wa_list),
-                    "wa_count": len(wa_list),
-                    "non_wa_count": max(0, len(collected_global) - len(wa_list)),
-                    "searched": len(collected_global),
-                    "exhausted": exhausted_all
-                })
-            else:
-                raw = collected_global[:n]
-                yield json_event("done", {
-                    "count": len(raw),
-                    "wa_count": 0,
-                    "non_wa_count": 0,
-                    "searched": len(collected_global),
-                    "exhausted": exhausted_all
-                })
-
+            yield _sse("done", {
+                "count": min(wa_count, n) if verify==1 else min(len(seen), n),
+                "wa_count": wa_count if verify==1 else 0,
+                "non_wa_count": non_wa_count if verify==1 else 0,
+                "searched": searched,
+                "exhausted": exhausted
+            })
         except Exception as e:
-            yield json_event("error", {"error": f"{type(e).__name__}: {e}"})
+            yield _sse("error", {"error": f"server_error: {type(e).__name__}"})
 
     return StreamingResponse(gen(), media_type="text/event-stream")
