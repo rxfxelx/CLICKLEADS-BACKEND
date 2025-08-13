@@ -1,13 +1,21 @@
+import os
 import re
 import time
+import random
 import urllib.parse
-from typing import Dict, List, Set, Tuple
+from typing import Generator, Set
 
 import phonenumbers
 from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError
 
-# Regex de telefone (Brasil) — robusto para card/aria/innerText
+# Regex BR no HTML dos resultados locais
 PHONE_RE = re.compile(r"\+?(\d[\d .()\-]{8,}\d)")
+
+# ---------- ENV / perfis ----------
+BROWSER_POOL = [e.strip() for e in os.getenv("BROWSER_POOL", "chromium").split(",") if e.strip()]
+PROFILE_ROOT = os.getenv("PLAYWRIGHT_PROFILE_DIR", "/app/.pw-profiles")
+HEADLESS = os.getenv("HEADLESS", "1") != "0"
+TZ = os.getenv("PLAYWRIGHT_TZ", "America/Sao_Paulo")
 
 def norm_br_e164(raw: str) -> str | None:
     d = re.sub(r"\D", "", raw or "")
@@ -24,7 +32,6 @@ def norm_br_e164(raw: str) -> str | None:
     return None
 
 def _accept_consent(page):
-    # Alguns diálogos do Google
     sels = [
         "#L2AGLb",
         "button:has-text('Aceitar tudo')",
@@ -42,162 +49,164 @@ def _accept_consent(page):
         except Exception:
             pass
 
-def _numbers_from_local_page(page) -> List[str]:
-    """
-    Extrai números usando:
-     1) a[href^='tel:']
-     2) Regex no texto dos cartões e painel lateral
-    """
-    out: List[str] = []
-    seen: Set[str] = set()
-
-    # 1) links tel:
-    for a in page.locator('a[href^="tel:"]').all():
-        try:
-            raw = (a.get_attribute("href") or "").replace("tel:", "")
-            tel = norm_br_e164(raw)
-            if tel and tel not in seen:
-                seen.add(tel); out.append(tel)
-        except Exception:
-            continue
-
-    # 2) Regex no body (cartões + painel)
+def _is_blocked(page) -> bool:
+    """Detecta bloqueio Google e sai sem insistir (sem tentar contornar)."""
     try:
-        blob = page.inner_text("body")
-        for m in PHONE_RE.findall(blob or ""):
-            tel = norm_br_e164(m)
-            if tel and tel not in seen:
-                seen.add(tel); out.append(tel)
+        u = page.url or ""
+        if "/sorry/" in u:
+            return True
+        txt = ((page.title() or "") + " " + (page.inner_text("body") or "")).lower()
+        for s in ("unusual traffic", "verify you are a human", "nossos sistemas detectaram",
+                  "activity from your system", "captcha"):
+            if s in txt:
+                return True
     except Exception:
         pass
+    return False
 
-    return out
+def _numbers_from_page(page) -> Set[str]:
+    found: Set[str] = set()
+    # 1) links tel:
+    try:
+        for el in page.locator('a[href^="tel:"]').all():
+            href = (el.get_attribute("href") or "")[4:]
+            tel = norm_br_e164(href)
+            if tel:
+                found.add(tel)
+    except Exception:
+        pass
+    # 2) regex no corpo
+    try:
+        body = page.inner_text("body") or ""
+        for m in PHONE_RE.findall(body):
+            tel = norm_br_e164(m)
+            if tel:
+                found.add(tel)
+    except Exception:
+        pass
+    return found
 
-def collect_numbers_for_city(nicho: str, city: str, limit: int, start: int) -> Tuple[List[str], int, int, bool]:
+def _pick_engine():
+    return random.choice(BROWSER_POOL or ["chromium"])
+
+def _random_ua():
+    UAS = [
+        # Chrome Win
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        # Firefox Linux
+        "Mozilla/5.0 (X11; Linux x86_64; rv:126.0) Gecko/20100101 Firefox/126.0",
+        # Safari Mac
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 13_5) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) Version/17.0 Safari/605.1.15",
+    ]
+    return random.choice(UAS)
+
+def _random_viewport():
+    return {"width": random.randint(1200, 1440), "height": random.randint(800, 920)}
+
+def _launch_persistent_context(p):
+    engine = _pick_engine()
+    ua = _random_ua()
+    vp = _random_viewport()
+
+    profile_dir = os.path.join(PROFILE_ROOT, f"default-{engine}")
+    os.makedirs(profile_dir, exist_ok=True)
+
+    args = ["--no-sandbox", "--disable-dev-shm-usage"]
+    common_opts = dict(
+        headless=HEADLESS,
+        args=args,
+        locale="pt-BR",
+        user_agent=ua,
+        viewport=vp,
+        timezone_id=TZ,
+    )
+
+    if engine == "firefox":
+        ctx = p.firefox.launch_persistent_context(profile_dir, **common_opts)
+    elif engine == "webkit":
+        ctx = p.webkit.launch_persistent_context(profile_dir, **common_opts)
+    else:
+        ctx = p.chromium.launch_persistent_context(profile_dir, **common_opts)
+
+    return ctx
+
+def iter_numbers(nicho: str, local: str, max_total: int = 200, step: int = 40) -> Generator[str, None, None]:
     """
-    Coleta 'limit' números para uma cidade, a partir de 'start' (paginação 0,20,40...).
-    Retorna (phones, searched, next_start, exhausted_city).
+    Gera telefones (E.164) do Google Local (tbm=lcl) de forma incremental.
+    Estratégia anti-ruído:
+      * contexto persistente (cookies/consent salvos),
+      * engines sorteadas (chromium/firefox/webkit),
+      * UA/viewport randômicos,
+      * pausas com jitter,
+      * sem clicar em cards (menos eventos),
+      * detecção de bloqueio e saída limpa.
     """
-    phones: List[str] = []
-    searched = 0
-    exhausted_city = False
+    seen: Set[str] = set()
+    produced = 0
+    q = urllib.parse.quote(f"{nicho} {local}")
+    start = 0
+    empty_pages = 0
+    last_seen_len = 0
 
-    q = urllib.parse.quote(f"{nicho} {city}")
+    try:
+        with sync_playwright() as p:
+            ctx = _launch_persistent_context(p)
+            # corta assets pesados
+            ctx.route("**/*", lambda r: r.abort()
+                     if r.request.resource_type in {"image", "font", "media"}
+                     else r.continue_())
 
-    with sync_playwright() as p:
-        browser = p.chromium.launch(headless=True, args=["--no-sandbox", "--disable-dev-shm-usage"])
-        ctx = browser.new_context(
-            locale="pt-BR",
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36")
-        )
-        # Bloqueia assets pesados
-        ctx.route("**/*", lambda r: r.abort() if r.request.resource_type in {"image","font","media"} else r.continue_())
-        ctx.set_default_timeout(9000)
-        ctx.set_default_navigation_timeout(18000)
+            page = ctx.new_page()
+            page.set_default_timeout(9000)
+            page.set_default_navigation_timeout(18000)
 
-        page = ctx.new_page()
+            while produced < max_total:
+                url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={start}"
+                try:
+                    page.goto(url, wait_until="domcontentloaded", timeout=18000)
+                except PWTimeoutError:
+                    empty_pages += 1
+                    if empty_pages >= 2:
+                        break
+                    start += 20
+                    continue
 
-        cur = start
-        # Guarda o último length para detectar "loop sem resultado"
-        last_count = -1
-        empty_pages = 0
+                _accept_consent(page)
 
-        while len(phones) < limit:
-            url = f"https://www.google.com/search?tbm=lcl&q={q}&hl=pt-BR&gl=BR&start={cur}"
-            try:
-                page.goto(url, wait_until="domcontentloaded", timeout=18000)
-            except PWTimeoutError:
-                empty_pages += 1
-                if empty_pages >= 2:
-                    exhausted_city = True
+                if _is_blocked(page):
                     break
-                cur += 20
-                continue
 
-            _accept_consent(page)
-
-            # aguarda render de algum card
-            had_cards = True
-            try:
-                page.wait_for_selector("div[role='article'], div.VkpGBb, div[role='feed']", timeout=7000)
-            except PWTimeoutError:
-                had_cards = False
-
-            new_nums = _numbers_from_local_page(page)
-            searched += len(new_nums)
-
-            # adiciona ao lot
-            for t in new_nums:
-                if t not in phones:
-                    phones.append(t)
-                    if len(phones) >= limit:
+                nums = _numbers_from_page(page)
+                added = 0
+                for tel in nums:
+                    if tel in seen:
+                        continue
+                    seen.add(tel)
+                    produced += 1
+                    added += 1
+                    yield tel
+                    if produced >= max_total:
                         break
 
-            if not had_cards:
-                empty_pages += 1
-            else:
-                empty_pages = 0
+                if added == 0:
+                    empty_pages += 1
+                else:
+                    empty_pages = 0
 
-            # detecta estagnação (sem novos)
-            if last_count == len(phones):
-                empty_pages += 1
-            else:
-                last_count = len(phones)
+                if last_seen_len == len(seen):
+                    empty_pages += 1
+                else:
+                    last_seen_len = len(seen)
 
-            # se insistimos e não vem nada, marcar esgotado
-            if empty_pages >= 3:
-                exhausted_city = True
-                break
-
-            cur += 20
-            # pequeno respiro para evitar recaptcha
-            time.sleep(0.6)
-
-        ctx.close()
-        browser.close()
-
-    return phones, searched, cur, exhausted_city
-
-def collect_numbers_batch(
-    nicho: str,
-    cities: List[str],
-    limit: int,
-    start_by_city: Dict[str, int] | None = None
-) -> Tuple[List[str], int, Dict[str, int], bool]:
-    """
-    Coleta até 'limit' números percorrendo as cidades na ordem recebida.
-    Mantém/atualiza offsets por cidade.
-    Retorna (phones, searched_total, next_start_by_city, exhausted_all)
-    """
-    if start_by_city is None:
-        start_by_city = {c: 0 for c in cities}
-
-    result: List[str] = []
-    searched_total = 0
-    exhausted_flags: Dict[str, bool] = {c: False for c in cities}
-
-    for city in cities:
-        if len(result) >= limit:
-            break
-        if exhausted_flags.get(city) is True:
-            continue
-
-        start = start_by_city.get(city, 0)
-        remaining = max(0, limit - len(result))
-        phones, searched, next_start, exhausted_city = collect_numbers_for_city(nicho, city, remaining, start)
-
-        # agrega mantendo ordem e sem duplicar
-        for t in phones:
-            if t not in result:
-                result.append(t)
-                if len(result) >= limit:
+                if empty_pages >= 3:
                     break
 
-        searched_total += searched
-        start_by_city[city] = next_start
-        exhausted_flags[city] = exhausted_city
+                start += 20
+                # jitter ajuda a não formar “assinatura” de bot
+                time.sleep(0.45 + random.random() * 0.45)
 
-    exhausted_all = all(exhausted_flags.get(c, False) for c in cities)
-
-    return result, searched_total, start_by_city, exhausted_all
+            ctx.close()
+    except Exception:
+        return
